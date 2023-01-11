@@ -4,17 +4,22 @@
 package gost
 
 import (
+	"encoding/json"
 	"fmt"
-	"regexp"
+	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/cenkalti/backoff"
+	"github.com/parnurzeal/gorequest"
 	"golang.org/x/exp/maps"
 	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
 	"github.com/future-architect/vuls/logging"
 	"github.com/future-architect/vuls/models"
+	"github.com/future-architect/vuls/util"
 	gostmodels "github.com/vulsio/gost/models"
 )
 
@@ -23,109 +28,66 @@ type Microsoft struct {
 	Base
 }
 
-var kbIDPattern = regexp.MustCompile(`KB(\d{6,7})`)
-
 // DetectCVEs fills cve information that has in Gost
 func (ms Microsoft) DetectCVEs(r *models.ScanResult, _ bool) (nCVEs int, err error) {
-	if ms.driver == nil {
-		return 0, nil
-	}
-
-	var osName string
-	osName, ok := r.Optional["OSName"].(string)
-	if !ok {
-		logging.Log.Warnf("This Windows has wrong type option(OSName). UUID: %s", r.ServerUUID)
-	}
-
 	var products []string
-	if _, ok := r.Optional["InstalledProducts"]; ok {
-		switch ps := r.Optional["InstalledProducts"].(type) {
-		case []interface{}:
-			for _, p := range ps {
-				pname, ok := p.(string)
-				if !ok {
-					logging.Log.Warnf("skip products: %v", p)
+	for _, p := range r.Packages {
+		switch p.Name {
+		case "Microsoft Edge":
+			if ss := strings.Split(p.Version, "."); len(ss) > 0 {
+				v, err := strconv.ParseInt(ss[0], 10, 8)
+				if err != nil {
 					continue
 				}
-				products = append(products, pname)
+				if v > 44 {
+					products = append(products, fmt.Sprintf("Microsoft Edge (Chromium-based) in IE Mode on %s", r.Release))
+				} else {
+					products = append(products, fmt.Sprintf("Microsoft Edge (EdgeHTML-based) on %s", r.Release))
+				}
 			}
-		case []string:
-			for _, p := range ps {
-				products = append(products, p)
-			}
-		case nil:
-			logging.Log.Warnf("This Windows has no option(InstalledProducts). UUID: %s", r.ServerUUID)
+		default:
 		}
 	}
 
-	applied, unapplied := map[string]struct{}{}, map[string]struct{}{}
-	if _, ok := r.Optional["KBID"]; ok {
-		switch kbIDs := r.Optional["KBID"].(type) {
-		case []interface{}:
-			for _, kbID := range kbIDs {
-				s, ok := kbID.(string)
-				if !ok {
-					logging.Log.Warnf("skip KBID: %v", kbID)
-					continue
-				}
-				unapplied[strings.TrimPrefix(s, "KB")] = struct{}{}
-			}
-		case []string:
-			for _, kbID := range kbIDs {
-				unapplied[strings.TrimPrefix(kbID, "KB")] = struct{}{}
-			}
-		case nil:
-			logging.Log.Warnf("This Windows has no option(KBID). UUID: %s", r.ServerUUID)
+	var applied, unapplied []string
+	if r.WindowsKB != nil {
+		applied = r.WindowsKB.Applied
+		unapplied = r.WindowsKB.Unapplied
+	}
+
+	var cves map[string]gostmodels.MicrosoftCVE
+	if ms.driver == nil {
+		u, err := util.URLPathJoin(ms.baseURL, "microsoft", "kbids")
+		if err != nil {
+			return 0, xerrors.Errorf("Failed to join URLPath. err: %w", err)
 		}
 
-		for _, pkg := range r.Packages {
-			matches := kbIDPattern.FindAllStringSubmatch(pkg.Name, -1)
-			for _, match := range matches {
-				applied[match[1]] = struct{}{}
+		content := map[string]interface{}{"osName": r.Release, "installedProducts": products, "applied": applied, "unapplied": unapplied}
+		var body []byte
+		var errs []error
+		var resp *http.Response
+		f := func() error {
+			resp, body, errs = gorequest.New().Timeout(10 * time.Second).Post(u).SendStruct(content).Type("json").EndBytes()
+			if 0 < len(errs) || resp == nil || resp.StatusCode != 200 {
+				return xerrors.Errorf("HTTP POST error. url: %s, resp: %v, err: %+v", u, resp, errs)
 			}
+			return nil
+		}
+		notify := func(err error, t time.Duration) {
+			logging.Log.Warnf("Failed to HTTP POST. retrying in %s seconds. err: %+v", t, err)
+		}
+		if err := backoff.RetryNotify(f, backoff.NewExponentialBackOff(), notify); err != nil {
+			return 0, xerrors.Errorf("HTTP Error: %w", err)
+		}
+
+		if err := json.Unmarshal(body, &cves); err != nil {
+			return 0, xerrors.Errorf("Failed to Unmarshal. body: %s, err: %w", body, err)
 		}
 	} else {
-		switch kbIDs := r.Optional["AppliedKBID"].(type) {
-		case []interface{}:
-			for _, kbID := range kbIDs {
-				s, ok := kbID.(string)
-				if !ok {
-					logging.Log.Warnf("skip KBID: %v", kbID)
-					continue
-				}
-				applied[strings.TrimPrefix(s, "KB")] = struct{}{}
-			}
-		case []string:
-			for _, kbID := range kbIDs {
-				applied[strings.TrimPrefix(kbID, "KB")] = struct{}{}
-			}
-		case nil:
-			logging.Log.Warnf("This Windows has no option(AppliedKBID). UUID: %s", r.ServerUUID)
+		cves, err = ms.driver.GetCvesByMicrosoftKBID(r.Release, products, applied, unapplied)
+		if err != nil {
+			return 0, xerrors.Errorf("Failed to detect CVEs. err: %w", err)
 		}
-
-		switch kbIDs := r.Optional["UnappliedKBID"].(type) {
-		case []interface{}:
-			for _, kbID := range kbIDs {
-				s, ok := kbID.(string)
-				if !ok {
-					logging.Log.Warnf("skip KBID: %v", kbID)
-					continue
-				}
-				unapplied[strings.TrimPrefix(s, "KB")] = struct{}{}
-			}
-		case []string:
-			for _, kbID := range kbIDs {
-				unapplied[strings.TrimPrefix(kbID, "KB")] = struct{}{}
-			}
-		case nil:
-			logging.Log.Warnf("This Windows has no option(UnappliedKBID). UUID: %s", r.ServerUUID)
-		}
-	}
-
-	logging.Log.Debugf(`GetCvesByMicrosoftKBID query body {"osName": %s, "installedProducts": %q, "applied": %q, "unapplied: %q"}`, osName, products, maps.Keys(applied), maps.Keys(unapplied))
-	cves, err := ms.driver.GetCvesByMicrosoftKBID(osName, products, maps.Keys(applied), maps.Keys(unapplied))
-	if err != nil {
-		return 0, xerrors.Errorf("Failed to detect CVEs. err: %w", err)
 	}
 
 	for cveID, cve := range cves {
@@ -149,11 +111,12 @@ func (ms Microsoft) DetectCVEs(r *models.ScanResult, _ bool) (nCVEs int, err err
 		}
 
 		r.ScannedCves[cveID] = models.VulnInfo{
-			CveID:            cveID,
-			Confidences:      models.Confidences{models.WindowsUpdateSearch},
-			DistroAdvisories: advisories,
-			CveContents:      models.NewCveContents(*cveCont),
-			Mitigations:      mitigations,
+			CveID:             cveID,
+			Confidences:       models.Confidences{models.WindowsUpdateSearch},
+			DistroAdvisories:  advisories,
+			CveContents:       models.NewCveContents(*cveCont),
+			Mitigations:       mitigations,
+			WindowsKBFixedIns: maps.Keys(uniqKB),
 		}
 	}
 	return len(cves), nil

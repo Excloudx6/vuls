@@ -149,64 +149,79 @@ func (s Scanner) Configtest() error {
 
 // ViaHTTP scans servers by HTTP header and body
 func ViaHTTP(header http.Header, body string, toLocalFile bool) (models.ScanResult, error) {
-	family := header.Get("X-Vuls-OS-Family")
-	if family == "" {
-		return models.ScanResult{}, errOSFamilyHeader
-	}
-
-	release := header.Get("X-Vuls-OS-Release")
-	if release == "" {
-		return models.ScanResult{}, errOSReleaseHeader
-	}
-
-	kernelRelease := header.Get("X-Vuls-Kernel-Release")
-	if kernelRelease == "" {
-		logging.Log.Warn("If X-Vuls-Kernel-Release is not specified, there is a possibility of false detection")
-	}
-
-	kernelVersion := header.Get("X-Vuls-Kernel-Version")
-	if family == constant.Debian {
-		if kernelVersion == "" {
-			logging.Log.Warn("X-Vuls-Kernel-Version is empty. skip kernel vulnerability detection.")
-		} else {
-			if _, err := debver.NewVersion(kernelVersion); err != nil {
-				logging.Log.Warnf("X-Vuls-Kernel-Version is invalid. skip kernel vulnerability detection. actual kernelVersion: %s, err: %s", kernelVersion, err)
-				kernelVersion = ""
-			}
-		}
-	}
-
 	serverName := header.Get("X-Vuls-Server-Name")
 	if toLocalFile && serverName == "" {
 		return models.ScanResult{}, errServerNameHeader
 	}
 
-	distro := config.Distro{
-		Family:  family,
-		Release: release,
+	family := header.Get("X-Vuls-OS-Family")
+	if family == "" {
+		return models.ScanResult{}, errOSFamilyHeader
 	}
 
-	kernel := models.Kernel{
-		Release: kernelRelease,
-		Version: kernelVersion,
-	}
-	installedPackages, srcPackages, err := ParseInstalledPkgs(distro, kernel, body)
-	if err != nil {
-		return models.ScanResult{}, err
-	}
+	switch family {
+	case constant.Windows:
+		release, applied, err := parseSystemInfo(body)
+		if err != nil {
+			return models.ScanResult{}, err
+		}
+		return models.ScanResult{
+			ServerName:  serverName,
+			Family:      family,
+			Release:     release,
+			WindowsKB:   &models.WindowsKB{Applied: applied},
+			ScannedCves: models.VulnInfos{},
+		}, nil
+	default:
+		release := header.Get("X-Vuls-OS-Release")
+		if release == "" {
+			return models.ScanResult{}, errOSReleaseHeader
+		}
 
-	return models.ScanResult{
-		ServerName: serverName,
-		Family:     family,
-		Release:    release,
-		RunningKernel: models.Kernel{
+		kernelRelease := header.Get("X-Vuls-Kernel-Release")
+		if kernelRelease == "" {
+			logging.Log.Warn("If X-Vuls-Kernel-Release is not specified, there is a possibility of false detection")
+		}
+
+		kernelVersion := header.Get("X-Vuls-Kernel-Version")
+		if family == constant.Debian {
+			if kernelVersion == "" {
+				logging.Log.Warn("X-Vuls-Kernel-Version is empty. skip kernel vulnerability detection.")
+			} else {
+				if _, err := debver.NewVersion(kernelVersion); err != nil {
+					logging.Log.Warnf("X-Vuls-Kernel-Version is invalid. skip kernel vulnerability detection. actual kernelVersion: %s, err: %s", kernelVersion, err)
+					kernelVersion = ""
+				}
+			}
+		}
+
+		distro := config.Distro{
+			Family:  family,
+			Release: release,
+		}
+
+		kernel := models.Kernel{
 			Release: kernelRelease,
 			Version: kernelVersion,
-		},
-		Packages:    installedPackages,
-		SrcPackages: srcPackages,
-		ScannedCves: models.VulnInfos{},
-	}, nil
+		}
+		installedPackages, srcPackages, err := ParseInstalledPkgs(distro, kernel, body)
+		if err != nil {
+			return models.ScanResult{}, err
+		}
+
+		return models.ScanResult{
+			ServerName: serverName,
+			Family:     family,
+			Release:    release,
+			RunningKernel: models.Kernel{
+				Release: kernelRelease,
+				Version: kernelVersion,
+			},
+			Packages:    installedPackages,
+			SrcPackages: srcPackages,
+			ScannedCves: models.VulnInfos{},
+		}, nil
+	}
 }
 
 // ParseInstalledPkgs parses installed pkgs line
@@ -694,6 +709,11 @@ func (s Scanner) detectOS(c config.ServerInfo) osTypeInterface {
 
 	if itsMe, osType := detectAlpine(c); itsMe {
 		logging.Log.Debugf("Alpine. Host: %s:%s", c.Host, c.Port)
+		return osType
+	}
+
+	if itsMe, osType := detectWindows(c); itsMe {
+		logging.Log.Debugf("Windows. Host: %s:%s", c.Host, c.Port)
 		return osType
 	}
 

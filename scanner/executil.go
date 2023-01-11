@@ -9,11 +9,12 @@ import (
 	"syscall"
 	"time"
 
+	homedir "github.com/mitchellh/go-homedir"
 	"golang.org/x/xerrors"
 
 	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/constant"
 	"github.com/future-architect/vuls/logging"
-	homedir "github.com/mitchellh/go-homedir"
 )
 
 type execResult struct {
@@ -152,8 +153,8 @@ func localExec(c config.ServerInfo, cmdstr string, sudo bool) (result execResult
 	cmdstr = decorateCmd(c, cmdstr, sudo)
 	var cmd *ex.Cmd
 	switch c.Distro.Family {
-	// case conf.FreeBSD, conf.Alpine, conf.Debian:
-	// cmd = ex.Command("/bin/sh", "-c", cmdstr)
+	case constant.Windows:
+		cmd = ex.Command("powershell.exe", "-NoProfile", "-NonInteractive", cmdstr)
 	default:
 		cmd = ex.Command("/bin/sh", "-c", cmdstr)
 	}
@@ -229,7 +230,12 @@ func sshExecExternal(c config.ServerInfo, cmd string, sudo bool) (result execRes
 	args = append(args, c.Host)
 
 	cmd = decorateCmd(c, cmd, sudo)
-	cmd = fmt.Sprintf("stty cols 1000; %s", cmd)
+	switch c.Distro.Family {
+	case constant.Windows:
+		cmd = fmt.Sprintf("powershell.exe -NoProfile -NonInteractive %s", cmd)
+	default:
+		cmd = fmt.Sprintf("stty cols 1000; %s", cmd)
+	}
 
 	args = append(args, cmd)
 	execCmd := ex.Command(sshBinaryPath, args...)
