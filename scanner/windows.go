@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"golang.org/x/exp/maps"
+	"golang.org/x/exp/slices"
 	"golang.org/x/xerrors"
 
 	"github.com/future-architect/vuls/config"
@@ -21,6 +22,17 @@ type windows struct {
 	base
 }
 
+type osInfo struct {
+	productName      string
+	version          string
+	build            string
+	revision         string
+	edition          string
+	servicePack      string
+	arch             string
+	installationType string
+}
+
 func newWindows(c config.ServerInfo) *windows {
 	d := &windows{
 		base: base{
@@ -28,7 +40,6 @@ func newWindows(c config.ServerInfo) *windows {
 				Packages:  models.Packages{},
 				VulnInfos: models.VulnInfos{},
 			},
-			windowsKB: &models.WindowsKB{},
 		},
 	}
 	d.log = logging.NewNormalLogger()
@@ -37,33 +48,85 @@ func newWindows(c config.ServerInfo) *windows {
 }
 
 func detectWindows(c config.ServerInfo) (bool, osTypeInterface) {
-	w := newWindows(c)
-	w.setDistro(constant.Windows, "")
-	if r := w.exec("systeminfo.exe", noSudo); r.isSuccess() {
-		release, _, err := parseSystemInfo(r.Stdout)
+	tmp := c
+	tmp.Distro.Family = constant.Windows
+
+	if r, r2 := exec(tmp, `$CurrentVersion = (Get-ItemProperty -Path "Registry::HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion"); Format-List -InputObject $CurrentVersion -Property ProductName, CurrentVersion, CurrentMajorVersionNumber, CurrentMinorVersionNumber, CurrentBuildNumber, UBR, CSDVersion, EditionID, InstallationType`, noSudo), exec(tmp, `(Get-ItemProperty -Path "Registry::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Session Manager\Environment").PROCESSOR_ARCHITECTURE`, noSudo); r.isSuccess() && r2.isSuccess() {
+		w := newWindows(c)
+		osInfo, err := parseRegistry(r.Stdout, r2.Stdout)
 		if err != nil {
-			w.setErrs([]error{xerrors.Errorf("Failed to parse systeminfo.exe. err: %w", err)})
+			w.setErrs([]error{xerrors.Errorf("Failed to parse Registry. err: %w", err)})
+			return true, w
+		}
+
+		release, err := detectOSName(osInfo)
+		if err != nil {
+			w.setErrs([]error{xerrors.Errorf("Failed to detect os name. err: %w", err)})
 			return true, w
 		}
 		w.setDistro(constant.Windows, release)
+		w.Kernel = models.Kernel{Version: formatKernelVersion(osInfo)}
+		return true, w
 	}
 
-	if r := w.exec("Get-ComputerInfo | Select WindowsProductName, OsVersion, WindowsEditionId, OsCSDVersion, CsSystemType, WindowsInstallationType | Format-List", noSudo); r.isSuccess() {
-		release, err := parseGetComputerInfo(r.Stdout)
+	if r := exec(tmp, "Get-ComputerInfo -Property WindowsProductName, OsVersion, WindowsEditionId, OsCSDVersion, CsSystemType, WindowsInstallationType", noSudo); r.isSuccess() {
+		w := newWindows(c)
+		osInfo, err := parseGetComputerInfo(r.Stdout)
 		if err != nil {
 			w.setErrs([]error{xerrors.Errorf("Failed to parse Get-ComputerInfo. err: %w", err)})
 			return true, w
 		}
-		w.setDistro(constant.Windows, release)
-	}
 
-	if w.getServerInfo().Distro.Release != "" {
+		release, err := detectOSName(osInfo)
+		if err != nil {
+			w.setErrs([]error{xerrors.Errorf("Failed to detect os name. err: %w", err)})
+			return true, w
+		}
+		w.setDistro(constant.Windows, release)
+		w.Kernel = models.Kernel{Version: formatKernelVersion(osInfo)}
 		return true, w
 	}
+
+	if r := exec(tmp, "$WmiOS = (Get-WmiObject Win32_OperatingSystem); Format-List -InputObject $WmiOS -Property Caption, Version, OperatingSystemSKU, CSDVersion; $WmiCS = (Get-WmiObject Win32_ComputerSystem); Format-List -InputObject $WmiCS -Property SystemType, DomainRole", noSudo); r.isSuccess() {
+		w := newWindows(c)
+		osInfo, err := parseWmiObject(r.Stdout)
+		if err != nil {
+			w.setErrs([]error{xerrors.Errorf("Failed to parse Get-WmiObject. err: %w", err)})
+			return true, w
+		}
+
+		release, err := detectOSName(osInfo)
+		if err != nil {
+			w.setErrs([]error{xerrors.Errorf("Failed to detect os name. err: %w", err)})
+			return true, w
+		}
+		w.setDistro(constant.Windows, release)
+		w.Kernel = models.Kernel{Version: formatKernelVersion(osInfo)}
+		return true, w
+	}
+
+	if r := exec(tmp, "systeminfo.exe", noSudo); r.isSuccess() {
+		w := newWindows(c)
+		osInfo, _, err := parseSystemInfo(r.Stdout)
+		if err != nil {
+			w.setErrs([]error{xerrors.Errorf("Failed to parse systeminfo.exe. err: %w", err)})
+			return true, w
+		}
+
+		release, err := detectOSName(osInfo)
+		if err != nil {
+			w.setErrs([]error{xerrors.Errorf("Failed to detect os name. err: %w", err)})
+			return true, w
+		}
+		w.setDistro(constant.Windows, release)
+		w.Kernel = models.Kernel{Version: formatKernelVersion(osInfo)}
+		return true, w
+	}
+
 	return false, nil
 }
 
-func parseSystemInfo(stdout string) (string, []string, error) {
+func parseSystemInfo(stdout string) (osInfo, []string, error) {
 	var (
 		o   osInfo
 		kbs []string
@@ -71,6 +134,20 @@ func parseSystemInfo(stdout string) (string, []string, error) {
 	scanner := bufio.NewScanner(strings.NewReader(stdout))
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		switch {
+		case strings.HasPrefix(line, "OS 名:"):
+			line = strings.NewReplacer("OS 名:", "OS Name:").Replace(line)
+		case strings.HasPrefix(line, "OS バージョン:"):
+			line = strings.NewReplacer("OS バージョン:", "OS Version:", "ビルド", "Build").Replace(line)
+		case strings.HasPrefix(line, "システムの種類:"):
+			line = strings.NewReplacer("システムの種類:", "System Type:").Replace(line)
+		case strings.HasPrefix(line, "OS 構成:"):
+			line = strings.NewReplacer("OS 構成:", "OS Configuration:", "サーバー", "Server", "ワークステーション", "Workstation").Replace(line)
+		case strings.HasPrefix(line, "ホットフィックス:"):
+			line = strings.NewReplacer("ホットフィックス:", "Hotfix(s):", "ホットフィックスがインストールされています。", "Hotfix(s) Installed.").Replace(line)
+		default:
+		}
 
 		switch {
 		case strings.HasPrefix(line, "OS Name:"):
@@ -93,12 +170,12 @@ func parseSystemInfo(stdout string) (string, []string, error) {
 			case strings.Contains(line, "Workstation"):
 				o.installationType = "Client"
 			default:
-				return "", nil, xerrors.Errorf("Failed to detect installation type. line: %s", line)
+				return osInfo{}, nil, xerrors.Errorf("Failed to detect installation type. line: %s", line)
 			}
 		case strings.HasPrefix(line, "Hotfix(s):"):
 			nKB, err := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(line, "Hotfix(s):"), "Hotfix(s) Installed.")))
 			if err != nil {
-				return "", nil, xerrors.Errorf("Failed to detect number of installed hotfix from %s", line)
+				return osInfo{}, nil, xerrors.Errorf("Failed to detect number of installed hotfix from %s", line)
 			}
 			for i := 0; i < nKB; i++ {
 				scanner.Scan()
@@ -115,14 +192,10 @@ func parseSystemInfo(stdout string) (string, []string, error) {
 		default:
 		}
 	}
-	release, err := detectOSName(o)
-	if err != nil {
-		return "", nil, xerrors.Errorf("Failed to detect os name. err: %w", err)
-	}
-	return release, kbs, nil
+	return o, kbs, nil
 }
 
-func parseGetComputerInfo(stdout string) (string, error) {
+func parseGetComputerInfo(stdout string) (osInfo, error) {
 	var o osInfo
 	scanner := bufio.NewScanner(strings.NewReader(stdout))
 	for scanner.Scan() {
@@ -132,13 +205,13 @@ func parseGetComputerInfo(stdout string) (string, error) {
 		case strings.HasPrefix(line, "WindowsProductName"):
 			_, rhs, found := strings.Cut(line, ":")
 			if !found {
-				return "", xerrors.Errorf(`Failed to detect ProductName. expected: "WindowsProductName : <ProductName>", line: "%s"`, line)
+				return osInfo{}, xerrors.Errorf(`Failed to detect ProductName. expected: "WindowsProductName : <ProductName>", line: "%s"`, line)
 			}
 			o.productName = strings.TrimSpace(rhs)
 		case strings.HasPrefix(line, "OsVersion"):
 			_, rhs, found := strings.Cut(line, ":")
 			if !found {
-				return "", xerrors.Errorf(`Failed to detect OsVersion. expected: "OsVersion : <Version>", line: "%s"`, line)
+				return osInfo{}, xerrors.Errorf(`Failed to detect OsVersion. expected: "OsVersion : <Version>", line: "%s"`, line)
 			}
 			ss := strings.Split(strings.TrimSpace(rhs), ".")
 			o.version = strings.Join(ss[0:len(ss)-1], ".")
@@ -146,45 +219,328 @@ func parseGetComputerInfo(stdout string) (string, error) {
 		case strings.HasPrefix(line, "WindowsEditionId"):
 			_, rhs, found := strings.Cut(line, ":")
 			if !found {
-				return "", xerrors.Errorf(`Failed to detect WindowsEditionId. expected: "WindowsEditionId : <EditionId>", line: "%s"`, line)
+				return osInfo{}, xerrors.Errorf(`Failed to detect WindowsEditionId. expected: "WindowsEditionId : <EditionId>", line: "%s"`, line)
 			}
 			o.edition = strings.TrimSpace(rhs)
 		case strings.HasPrefix(line, "OsCSDVersion"):
 			_, rhs, found := strings.Cut(line, ":")
 			if !found {
-				return "", xerrors.Errorf(`Failed to detect OsCSDVersion. expected: "OsCSDVersion : <CSDVersion>", line: "%s"`, line)
+				return osInfo{}, xerrors.Errorf(`Failed to detect OsCSDVersion. expected: "OsCSDVersion : <CSDVersion>", line: "%s"`, line)
 			}
 			o.servicePack = strings.TrimSpace(rhs)
 		case strings.HasPrefix(line, "CsSystemType"):
 			_, rhs, found := strings.Cut(line, ":")
 			if !found {
-				return "", xerrors.Errorf(`Failed to detect CsSystemType. expected: "CsSystemType : <SystemType>", line: "%s"`, line)
+				return osInfo{}, xerrors.Errorf(`Failed to detect CsSystemType. expected: "CsSystemType : <SystemType>", line: "%s"`, line)
 			}
 			o.arch = strings.TrimSpace(strings.TrimSuffix(rhs, "PC"))
 		case strings.HasPrefix(line, "WindowsInstallationType"):
 			_, rhs, found := strings.Cut(line, ":")
 			if !found {
-				return "", xerrors.Errorf(`Failed to detect WindowsInstallationType. expected: "WindowsInstallationType : <InstallationType>", line: "%s"`, line)
+				return osInfo{}, xerrors.Errorf(`Failed to detect WindowsInstallationType. expected: "WindowsInstallationType : <InstallationType>", line: "%s"`, line)
 			}
 			o.installationType = strings.TrimSpace(rhs)
 		default:
 		}
 	}
-	release, err := detectOSName(o)
-	if err != nil {
-		return "", xerrors.Errorf("Failed to detect os name. err: %w", err)
-	}
-	return release, nil
+	return o, nil
 }
 
-type osInfo struct {
-	productName      string
-	version          string
-	build            string
-	edition          string
-	servicePack      string
-	arch             string
-	installationType string
+func parseWmiObject(stdout string) (osInfo, error) {
+	var o osInfo
+	scanner := bufio.NewScanner(strings.NewReader(stdout))
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		switch {
+		case strings.HasPrefix(line, "Caption"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect Caption. expected: "Caption : <Caption>", line: "%s"`, line)
+			}
+			o.productName = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "Version"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect Version. expected: "Version : <Version>", line: "%s"`, line)
+			}
+			ss := strings.Split(strings.TrimSpace(rhs), ".")
+			o.version = strings.Join(ss[0:len(ss)-1], ".")
+			o.build = ss[len(ss)-1]
+		case strings.HasPrefix(line, "OperatingSystemSKU"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect OperatingSystemSKU. expected: "OperatingSystemSKU : <OperatingSystemSKU>", line: "%s"`, line)
+			}
+			switch n := strings.TrimSpace(rhs); n {
+			case "0":
+				o.edition = "Undefined"
+			case "1":
+				o.edition = "Ultimate"
+				o.installationType = "Client"
+			case "2":
+				o.edition = "Home Basic"
+				o.installationType = "Client"
+			case "3":
+				o.edition = "Home Premium"
+				o.installationType = "Client"
+			case "4":
+				o.edition = "Enterprise"
+				o.installationType = "Client"
+			case "6":
+				o.edition = "Business"
+				o.installationType = "Client"
+			case "7":
+				o.edition = "Windows Server Standard Edition (Desktop Experience installation)"
+				o.installationType = "Server"
+			case "8":
+				o.edition = "Windows Server Datacenter Edition (Desktop Experience installation)"
+				o.installationType = "Server"
+			case "9":
+				o.edition = "Small Business Server"
+				o.installationType = "Server"
+			case "10":
+				o.edition = "Enterprise Server"
+				o.installationType = "Server"
+			case "11":
+				o.edition = "Starter"
+			case "12":
+				o.edition = "Datacenter Server Core"
+				o.installationType = "Server Core"
+			case "13":
+				o.edition = "Standard Server Core"
+				o.installationType = "Server Core"
+			case "14":
+				o.edition = "Enterprise Server Core"
+				o.installationType = "Server Core"
+			case "17":
+				o.edition = "Web Server"
+				o.installationType = "Server"
+			case "19":
+				o.edition = "Home Server"
+				o.installationType = "Server"
+			case "20":
+				o.edition = "Storage Express Server"
+				o.installationType = "Server"
+			case "21":
+				o.edition = "Windows Storage Server Standard"
+				o.installationType = "Server"
+			case "22":
+				o.edition = "Windows Storage Server Workgroup"
+				o.installationType = "Server"
+			case "23":
+				o.edition = "Storage Enterprise Server"
+				o.installationType = "Server"
+			case "24":
+				o.edition = "Server For Small Business"
+				o.installationType = "Server"
+			case "25":
+				o.edition = "Small Business Server Premium"
+				o.installationType = "Server"
+			case "27":
+				o.edition = "Enterprise"
+				o.installationType = "Client"
+			case "28":
+				o.edition = "Ultimate"
+				o.installationType = "Client"
+			case "29":
+				o.edition = "Windows Server Web Server Edition (Server Core installation)"
+				o.installationType = "Server Core"
+			case "36":
+				o.edition = "Windows Server Standard Edition without Hyper-V"
+				o.installationType = "Server"
+			case "37":
+				o.edition = "Windows Server Datacenter Edition without Hyper-V (full installation)"
+				o.installationType = "Server"
+			case "38":
+				o.edition = "Windows Server Enterprise Edition without Hyper-V (full installation)"
+				o.installationType = "Server"
+			case "39":
+				o.edition = "Windows Server Datacenter Edition without Hyper-V (Server Core installation)"
+				o.installationType = "Server Core"
+			case "40":
+				o.edition = "Windows Server Standard Edition without Hyper-V (Server Core installation)"
+				o.installationType = "Server Core"
+			case "41":
+				o.edition = "Windows Server Enterprise Edition without Hyper-V (Server Core installation)"
+				o.installationType = "Server Core"
+			case "42":
+				o.edition = "Microsoft Hyper-V Server"
+				o.installationType = "Server"
+			case "43":
+				o.edition = "Storage Server Express Edition (Server Core installation)"
+				o.installationType = "Server Core"
+			case "44":
+				o.edition = "Storage Server Standard Edition (Server Core installation)"
+				o.installationType = "Server Core"
+			case "45":
+				o.edition = "Storage Server Workgroup Edition (Server Core installation)"
+				o.installationType = "Server Core"
+			case "46":
+				o.edition = "Storage Server Enterprise Edition (Server Core installation)"
+				o.installationType = "Server Core"
+			case "48":
+				o.edition = "Professional"
+				o.installationType = "Client"
+			case "50":
+				o.edition = "Windows Server Essentials (Desktop Experience installation)"
+				o.installationType = "Server"
+			case "63":
+				o.edition = "Small Business Server Premium (Server Core installation)"
+				o.installationType = "Server Core"
+			case "64":
+				o.edition = "Windows Compute Cluster Server without Hyper-V"
+				o.installationType = "Server"
+			case "97":
+				o.edition = "Windows RT"
+				o.installationType = "Client"
+			case "101":
+				o.edition = "Home"
+				o.installationType = "Client"
+			case "103":
+				o.edition = "Media Center"
+				o.installationType = "Client"
+			case "104":
+				o.edition = "Mobile"
+				o.installationType = "Client"
+			case "123":
+				o.edition = "Windows IoT (Internet of Things) Core"
+				o.installationType = "Client"
+			case "143":
+				o.edition = "Windows Server Datacenter Edition (Nano Server installation)"
+				o.installationType = "Server"
+			case "144":
+				o.edition = "Windows Server Standard Edition (Nano Server installation)"
+				o.installationType = "Server"
+			case "147":
+				o.edition = "Windows Server Datacenter Edition (Server Core installation)"
+				o.installationType = "Server Core"
+			case "148":
+				o.edition = "Windows Server Standard Edition (Server Core installation)"
+				o.installationType = "Server Core"
+			case "175":
+				o.edition = "Windows Enterprise for Virtual Desktops (Azure Virtual Desktop)"
+				o.installationType = "Client"
+			default:
+			}
+
+		case strings.HasPrefix(line, "CSDVersion"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect CSDVersion. expected: "CSDVersion : <CSDVersion>", line: "%s"`, line)
+			}
+			o.servicePack = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "SystemType"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect SystemType. expected: "SystemType : <SystemType>", line: "%s"`, line)
+			}
+			o.arch = strings.TrimSpace(strings.TrimSuffix(rhs, "PC"))
+		case strings.HasPrefix(line, "DomainRole"):
+			if o.installationType != "" {
+				break
+			}
+
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect DomainRole. expected: "DomainRole : <DomainRole>", line: "%s"`, line)
+			}
+			switch domainRole := strings.TrimSpace(rhs); domainRole { // https://learn.microsoft.com/en-us/windows/win32/api/dsrole/ne-dsrole-dsrole_machine_role
+			case "0", "1":
+				o.installationType = "Client"
+			case "2", "3":
+				o.installationType = "Server"
+			case "4", "5":
+				o.installationType = "Controller"
+			default:
+				return osInfo{}, xerrors.Errorf("Failed to detect Installation Type from DomainRole. err: %s is invalid DomainRole", domainRole)
+			}
+		default:
+		}
+	}
+	return o, nil
+}
+
+func parseRegistry(stdout, arch string) (osInfo, error) {
+	var (
+		o     osInfo
+		major string
+		minor string
+	)
+
+	scanner := bufio.NewScanner(strings.NewReader(stdout))
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		switch {
+		case strings.HasPrefix(line, "ProductName"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect ProductName. expected: "ProductName : <ProductName>", line: "%s"`, line)
+			}
+			o.productName = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "CurrentVersion"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect CurrentVersion. expected: "CurrentVersion : <Version>", line: "%s"`, line)
+			}
+			o.version = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "CurrentMajorVersionNumber"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect CurrentMajorVersionNumber. expected: "CurrentMajorVersionNumber : <Version>", line: "%s"`, line)
+			}
+			major = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "CurrentMinorVersionNumber"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect CurrentMinorVersionNumber. expected: "CurrentMinorVersionNumber : <Version>", line: "%s"`, line)
+			}
+			minor = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "CurrentBuildNumber"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect CurrentBuildNumber. expected: "CurrentBuildNumber : <Build>", line: "%s"`, line)
+			}
+			o.build = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "UBR"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect UBR. expected: "UBR : <Revision>", line: "%s"`, line)
+			}
+			o.revision = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "EditionID"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect EditionID. expected: "EditionID : <EditionID>", line: "%s"`, line)
+			}
+			o.edition = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "CSDVersion"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect CSDVersion. expected: "CSDVersion : <CSDVersion>", line: "%s"`, line)
+			}
+			o.servicePack = strings.TrimSpace(rhs)
+		case strings.HasPrefix(line, "InstallationType"):
+			_, rhs, found := strings.Cut(line, ":")
+			if !found {
+				return osInfo{}, xerrors.Errorf(`Failed to detect InstallationType. expected: "InstallationType : <InstallationType>", line: "%s"`, line)
+			}
+			o.installationType = strings.TrimSpace(rhs)
+		default:
+		}
+	}
+	if major != "" && minor != "" {
+		o.version = fmt.Sprintf("%s.%s", major, minor)
+	}
+
+	formatted, err := formatArch(arch)
+	if err != nil {
+		return osInfo{}, xerrors.Errorf("Failed to format arch. arch: %s, err: %w", arch, err)
+	}
+	o.arch = formatted
+
+	return o, nil
 }
 
 func detectOSName(osInfo osInfo) (string, error) {
@@ -225,7 +581,7 @@ func detectOSNameFromOSInfo(osInfo osInfo) (string, error) {
 				n = "Microsoft Windows XP"
 			}
 			switch osInfo.arch {
-			case "x64":
+			case "x64-based":
 				n = fmt.Sprintf("%s x64 Edition", n)
 			}
 			if osInfo.servicePack != "" {
@@ -248,7 +604,7 @@ func detectOSNameFromOSInfo(osInfo osInfo) (string, error) {
 				n = "Microsoft Windows XP"
 			}
 			switch osInfo.arch {
-			case "x64":
+			case "x64-based":
 				n = fmt.Sprintf("%s x64 Edition", n)
 			}
 			if osInfo.servicePack != "" {
@@ -261,9 +617,9 @@ func detectOSNameFromOSInfo(osInfo osInfo) (string, error) {
 				n = "Microsoft Windows Server 2003 R2"
 			}
 			switch osInfo.arch {
-			case "x64":
+			case "x64-based":
 				n = fmt.Sprintf("%s x64 Edition", n)
-			case "IA64":
+			case "Itanium-based":
 				if osInfo.edition == "Enterprise" {
 					n = fmt.Sprintf("%s, Enterprise Edition for Itanium-based Systems", n)
 				} else {
@@ -280,7 +636,7 @@ func detectOSNameFromOSInfo(osInfo osInfo) (string, error) {
 		case "Client":
 			var n string
 			switch osInfo.arch {
-			case "x64":
+			case "x64-based":
 				n = "Windows Vista x64 Editions"
 			default:
 				n = "Windows Vista"
@@ -403,13 +759,13 @@ func detectOSNameFromOSInfo(osInfo osInfo) (string, error) {
 
 func formatArch(arch string) (string, error) {
 	switch arch {
-	case "x64-based":
+	case "AMD64", "x64-based":
 		return "x64-based", nil
-	case "ARM64-based":
+	case "ARM64", "ARM64-based":
 		return "ARM64-based", nil
-	case "Itanium-based":
+	case "IA64", "Itanium-based":
 		return "Itanium-based", nil
-	case "X86-based":
+	case "x86", "X86-based":
 		return "32-bit", nil
 	default:
 		return "", xerrors.New("CPU Architecture not found")
@@ -548,17 +904,31 @@ func formatNamebyBuild(osType string, mybuild string) (string, error) {
 		return "", xerrors.New("OS Type not found")
 	}
 
+	nMybuild, err := strconv.Atoi(mybuild)
+	if err != nil {
+		return "", xerrors.Errorf("Failed to parse build number. err: %w", err)
+	}
+
 	v := builds[0].name
 	for _, b := range builds {
-		if mybuild == b.build {
-			return b.name, nil
+		nBuild, err := strconv.Atoi(b.build)
+		if err != nil {
+			return "", xerrors.Errorf("Failed to parse build number. err: %w", err)
 		}
-		if mybuild < b.build {
+		if nMybuild < nBuild {
 			break
 		}
 		v = b.name
 	}
 	return v, nil
+}
+
+func formatKernelVersion(osInfo osInfo) string {
+	v := fmt.Sprintf("%s.%s", osInfo.version, osInfo.build)
+	if osInfo.revision != "" {
+		v = fmt.Sprintf("%s.%s", v, osInfo.revision)
+	}
+	return v
 }
 
 func (o *windows) checkScanMode() error {
@@ -582,7 +952,7 @@ func (o *windows) postScan() error {
 }
 
 func (o *windows) scanPackages() error {
-	if r := o.exec("Get-Package | Select Name, Version, ProviderName | Format-List", noSudo); r.isSuccess() {
+	if r := o.exec("$Packages = (Get-Package); Format-List -InputObject $Packages -Property Name, Version, ProviderName", noSudo); r.isSuccess() {
 		installed, _, err := o.parseInstalledPackages(r.Stdout)
 		if err != nil {
 			return xerrors.Errorf("Failed to parse installed packages. err: %w", err)
@@ -590,12 +960,11 @@ func (o *windows) scanPackages() error {
 		o.Packages = installed
 	}
 
-	applied, unapplied, err := o.scanKBs()
+	kbs, err := o.scanKBs()
 	if err != nil {
 		return xerrors.Errorf("Failed to scan KB. err: %w", err)
 	}
-	o.windowsKB.Applied = applied
-	o.windowsKB.Unapplied = unapplied
+	o.windowsKB = kbs
 
 	return nil
 }
@@ -642,22 +1011,22 @@ func (o *windows) parseInstalledPackages(stdout string) (models.Packages, models
 	return installed, nil, nil
 }
 
-func (o *windows) scanKBs() ([]string, []string, error) {
+func (o *windows) scanKBs() (*models.WindowsKB, error) {
 	applied, unapplied := map[string]struct{}{}, map[string]struct{}{}
-	if r := o.exec("Get-Hotfix | Select HotFixID | Format-List", noSudo); r.isSuccess() {
+	if r := o.exec("$Hotfix = (Get-Hotfix); Format-List -InputObject $Hotfix -Property HotFixID", noSudo); r.isSuccess() {
 		kbs, err := o.parseGetHotfix(r.Stdout)
 		if err != nil {
-			return nil, nil, xerrors.Errorf("Failed to parse Get-Hotifx. err: %w", err)
+			return nil, xerrors.Errorf("Failed to parse Get-Hotifx. err: %w", err)
 		}
 		for _, kb := range kbs {
 			applied[kb] = struct{}{}
 		}
 	}
 
-	if r := o.exec("Get-Package -ProviderName msu | Select Name | Format-List", noSudo); r.isSuccess() {
+	if r := o.exec("$Packages = (Get-Package -ProviderName msu); Format-List -InputObject $Packages -Property Name", noSudo); r.isSuccess() {
 		kbs, err := o.parseGetPackageMSU(r.Stdout)
 		if err != nil {
-			return nil, nil, xerrors.Errorf("Failed to parse Get-Package. err: %w", err)
+			return nil, xerrors.Errorf("Failed to parse Get-Package. err: %w", err)
 		}
 		for _, kb := range kbs {
 			applied[kb] = struct{}{}
@@ -667,62 +1036,67 @@ func (o *windows) scanKBs() ([]string, []string, error) {
 	var searcher string
 	switch c := o.getServerInfo().Windows; c.ServerSelection {
 	case 3: // https://learn.microsoft.com/en-us/windows/win32/wua_sdk/using-wua-to-scan-for-updates-offline
-		searcher = fmt.Sprintf(`$UpdateSession = New-Object -ComObject Microsoft.Update.Session
-$UpdateServiceManager = New-Object -ComObject Microsoft.Update.ServiceManager
-$UpdateService = $UpdateServiceManager.AddScanPackageService("Offline Sync Service", "%s", 1)
-$UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-$UpdateSearcher.ServerSelection = %d
-$UpdateSearcher.ServiceID = $UpdateService.ServiceID`, c.CabPath, c.ServerSelection)
+		searcher = fmt.Sprintf("$UpdateSession = (New-Object -ComObject Microsoft.Update.Session); $UpdateServiceManager = (New-Object -ComObject Microsoft.Update.ServiceManager); $UpdateService = $UpdateServiceManager.AddScanPackageService(\"Offline Sync Service\", \"%s\", 1); $UpdateSearcher = $UpdateSession.CreateUpdateSearcher(); $UpdateSearcher.ServerSelection = %d; $UpdateSearcher.ServiceID = $UpdateService.ServiceID", c.CabPath, c.ServerSelection)
 	default:
-		searcher = fmt.Sprintf(`$UpdateSession = New-Object -ComObject Microsoft.Update.Session
-$UpdateSearcher = $UpdateSession.CreateUpdateSearcher()
-$UpdateSearcher.ServerSelection = %d`, c.ServerSelection)
+		searcher = fmt.Sprintf("$UpdateSession = (New-Object -ComObject Microsoft.Update.Session); $UpdateSearcher = $UpdateSession.CreateUpdateSearcher(); $UpdateSearcher.ServerSelection = %d", c.ServerSelection)
 	}
 
-	if r := o.exec(fmt.Sprintf(`%s
-$UpdateSearcher.search("IsInstalled = 1 and RebootRequired = 0 and Type='Software'").Updates | %% {$_.KBArticleIDs}`, searcher), noSudo); r.isSuccess() {
+	if r := o.exec(fmt.Sprintf(`%s; $Updates = $UpdateSearcher.search("IsInstalled = 1 and RebootRequired = 0 and Type='Software'").Updates; ForEach-Object -InputObject $Updates {$_.KBArticleIDs}`, searcher), noSudo); r.isSuccess() {
 		kbs, err := o.parseWindowsUpdaterSearch(r.Stdout)
 		if err != nil {
-			return nil, nil, xerrors.Errorf("Failed to parse Windows Update Search. err: %w", err)
+			return nil, xerrors.Errorf("Failed to parse Windows Update Search. err: %w", err)
 		}
 		for _, kb := range kbs {
 			applied[kb] = struct{}{}
 		}
 	}
-	if r := o.exec(fmt.Sprintf(`%s
-$UpdateSearcher.search("IsInstalled = 0 and Type='Software'").Updates | %% {$_.KBArticleIDs}`, searcher), noSudo); r.isSuccess() {
+	if r := o.exec(fmt.Sprintf(`%s; $Updates = $UpdateSearcher.search("IsInstalled = 0 and Type='Software'").Updates; ForEach-Object -InputObject $Updates {$_.KBArticleIDs}`, searcher), noSudo); r.isSuccess() {
 		kbs, err := o.parseWindowsUpdaterSearch(r.Stdout)
 		if err != nil {
-			return nil, nil, xerrors.Errorf("Failed to parse Windows Update Search. err: %w", err)
+			return nil, xerrors.Errorf("Failed to parse Windows Update Search. err: %w", err)
 		}
 		for _, kb := range kbs {
 			unapplied[kb] = struct{}{}
 		}
 	}
-	if r := o.exec(fmt.Sprintf(`%s
-$UpdateSearcher.search("IsInstalled = 1 and RebootRequired = 1 and Type='Software'").Updates | %% {$_.KBArticleIDs}`, searcher), noSudo); r.isSuccess() {
+	if r := o.exec(fmt.Sprintf(`%s; $Updates = $UpdateSearcher.search("IsInstalled = 1 and RebootRequired = 1 and Type='Software'").Updates; ForEach-Object -InputObject $Updates {$_.KBArticleIDs}`, searcher), noSudo); r.isSuccess() {
 		kbs, err := o.parseWindowsUpdaterSearch(r.Stdout)
 		if err != nil {
-			return nil, nil, xerrors.Errorf("Failed to parse Windows Update Search. err: %w", err)
+			return nil, xerrors.Errorf("Failed to parse Windows Update Search. err: %w", err)
 		}
 		for _, kb := range kbs {
 			unapplied[kb] = struct{}{}
 		}
 	}
 
-	if r := o.exec(`$UpdateSearcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
-$HistoryCount = $UpdateSearcher.GetTotalHistoryCount()
-$UpdateSearcher.QueryHistory(0,$HistoryCount) | Sort-Object -Property Date | Select Title, Operation, ResultCode | Format-List`, noSudo); r.isSuccess() {
+	if r := o.exec("$UpdateSearcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher(); $HistoryCount = $UpdateSearcher.GetTotalHistoryCount(); $History = $UpdateSearcher.QueryHistory(0, $HistoryCount); $Sorted = Sort-Object -InputObject $History -Property Date; Format-List -InputObject $Sorted -Property Title, Operation, ResultCode", noSudo); r.isSuccess() {
 		kbs, err := o.parseWindowsUpdateHistory(r.Stdout)
 		if err != nil {
-			return nil, nil, xerrors.Errorf("Failed to parse Windows Update History. err: %w", err)
+			return nil, xerrors.Errorf("Failed to parse Windows Update History. err: %w", err)
 		}
 		for _, kb := range kbs {
 			applied[kb] = struct{}{}
 		}
 	}
 
-	return maps.Keys(applied), maps.Keys(unapplied), nil
+	v, err := o.detectKernelVersion(maps.Keys(applied))
+	if err != nil {
+		return nil, xerrors.Errorf("Failed to detect kernel version. err: %w", err)
+	}
+	o.Kernel = models.Kernel{Version: v}
+
+	kbs, err := o.detectKBsFromKernelVersion()
+	if err != nil {
+		return nil, xerrors.Errorf("Failed to detect KBs from kernel version. err: %w", err)
+	}
+	for _, kb := range kbs.Applied {
+		applied[kb] = struct{}{}
+	}
+	for _, kb := range kbs.Unapplied {
+		unapplied[kb] = struct{}{}
+	}
+
+	return &models.WindowsKB{Applied: maps.Keys(applied), Unapplied: maps.Keys(unapplied)}, nil
 }
 
 func (o *windows) parseGetHotfix(stdout string) ([]string, error) {
@@ -829,6 +1203,1104 @@ func (o *windows) parseWindowsUpdateHistory(stdout string) ([]string, error) {
 	}
 
 	return maps.Keys(kbs), nil
+}
+
+type windowsRelease struct {
+	revision string
+	kb       string
+}
+
+// TODO: without revision: Windows 7, 8, Server 2008, 2008 R2, 2012, 2012 R2, with revision: Windows 10, 11, Server 2016, 2019, 2022
+var windowsReleases = map[string]map[string][]windowsRelease{
+	// https://learn.microsoft.com/en-us/windows/release-health/release-information
+	"10": {
+		"10240": {
+			{revision: "16405", kb: "3074683"},
+			{revision: "16413", kb: "3081424"},
+			{revision: "16430", kb: "3081436"},
+			{revision: "16433", kb: "3081438"},
+			{revision: "16445", kb: "3081444"},
+			{revision: "16463", kb: "3081448"},
+			{revision: "16487", kb: "3081455"},
+			{revision: "16520", kb: "3093266"},
+			{revision: "16549", kb: "3097617"},
+			{revision: "16566", kb: "3105210"},
+			{revision: "16590", kb: "3105213"},
+			{revision: "16601", kb: "3116869"},
+			{revision: "16644", kb: "3124266"},
+			{revision: "16683", kb: "3135174"},
+			{revision: "16725", kb: "3140745"},
+			{revision: "16771", kb: "3147461"},
+			{revision: "16854", kb: "3156387"},
+			{revision: "16942", kb: "3163017"},
+			{revision: "17024", kb: "3163912"},
+			{revision: "17071", kb: "3176492"},
+			{revision: "17113", kb: "3185611"},
+			{revision: "17113", kb: "3193821"},
+			{revision: "17146", kb: "3192440"},
+			{revision: "17190", kb: "3198585"},
+			{revision: "17202", kb: "3205383"},
+			{revision: "17236", kb: "3210720"},
+			{revision: "17319", kb: "4012606"},
+			{revision: "17354", kb: "4015221"},
+			{revision: "17394", kb: "4019474"},
+			{revision: "17443", kb: "4022727"},
+			{revision: "17446", kb: "4032695"},
+			{revision: "17488", kb: "4025338"},
+			{revision: "17533", kb: "4034668"},
+			{revision: "17609", kb: "4038781"},
+			{revision: "17643", kb: "4042895"},
+			{revision: "17673", kb: "4048956"},
+			{revision: "17709", kb: "4053581"},
+			{revision: "17738", kb: "4056893"},
+			{revision: "17741", kb: "4075199"},
+			{revision: "17741", kb: "4077735"},
+			{revision: "17770", kb: "4074596"},
+			{revision: "17797", kb: "4088786"},
+			{revision: "17831", kb: "4093111"},
+			{revision: "17861", kb: "4103716"},
+			{revision: "17889", kb: "4284860"},
+			{revision: "17914", kb: "4338829"},
+			{revision: "17918", kb: "4345455"},
+			{revision: "17946", kb: "4343892"},
+			{revision: "17976", kb: "4457132"},
+			{revision: "18005", kb: "4462922"},
+			{revision: "18036", kb: "4467680"},
+			{revision: "18063", kb: "4471323"},
+			{revision: "18064", kb: "4483228"},
+			{revision: "18094", kb: "4480962"},
+			{revision: "18132", kb: "4487018"},
+			{revision: "18135", kb: "4491101"},
+			{revision: "18158", kb: "4489872"},
+			{revision: "18186", kb: "4493475"},
+			{revision: "18187", kb: "4498375"},
+			{revision: "18215", kb: "4499154"},
+			{revision: "18218", kb: "4505051"},
+			{revision: "18244", kb: "4503291"},
+			{revision: "18275", kb: "4507458"},
+			{revision: "18305", kb: "4512497"},
+			{revision: "18308", kb: "4517276"},
+			{revision: "18333", kb: "4516070"},
+			{revision: "18334", kb: "4522009"},
+			{revision: "18335", kb: "4524153"},
+			{revision: "18368", kb: "4520011"},
+			{revision: "18395", kb: "4525232"},
+			{revision: "18427", kb: "4530681"},
+			{revision: "18453", kb: "4534306"},
+			{revision: "18486", kb: "4537776"},
+			{revision: "18519", kb: "4540693"},
+			{revision: "18545", kb: "4550930"},
+			{revision: "18575", kb: "4556826"},
+			{revision: "18608", kb: "4561649"},
+			{revision: "18609", kb: "4567518"},
+			{revision: "18638", kb: "4565513"},
+			{revision: "18666", kb: "4571692"},
+			{revision: "18696", kb: "4577049"},
+			{revision: "18725", kb: "4580327"},
+			{revision: "18756", kb: "4586787"},
+			{revision: "18782", kb: "4592464"},
+			{revision: "18818", kb: "4598231"},
+			{revision: "18841", kb: "4601331"},
+			{revision: "18874", kb: "5000807"},
+			{revision: "18875", kb: "5001631"},
+			{revision: "18906", kb: "5001340"},
+			{revision: "18932", kb: "5003172"},
+			{revision: "18967", kb: "5003687"},
+			{revision: "18969", kb: "5004950"},
+			{revision: "19003", kb: "5004249"},
+			{revision: "19022", kb: "5005040"},
+			{revision: "19060", kb: "5005569"},
+			{revision: "19086", kb: "5006675"},
+			{revision: "19119", kb: "5007207"},
+			{revision: "19145", kb: "5008230"},
+			{revision: "19177", kb: "5009585"},
+			{revision: "19179", kb: "5010789"},
+			{revision: "19204", kb: "5010358"},
+			{revision: "19235", kb: "5011491"},
+			{revision: "19265", kb: "5012653"},
+			{revision: "19297", kb: "5013963"},
+			{revision: "19325", kb: "5014710"},
+			{revision: "19360", kb: "5015832"},
+			{revision: "19387", kb: "5016639"},
+			{revision: "19444", kb: "5017327"},
+			{revision: "19507", kb: "5018425"},
+			{revision: "19509", kb: "5020440"},
+			{revision: "19567", kb: "5019970"},
+			{revision: "19624", kb: "5021243"},
+			{revision: "19685", kb: "5022297"},
+		},
+		"10586": {
+			{revision: "3", kb: "3105211"},
+			{revision: "11", kb: "3118754"},
+			{revision: "14", kb: "3120677"},
+			{revision: "17", kb: "3116908"},
+			{revision: "29", kb: "3116900"},
+			{revision: "36", kb: "3124200"},
+			{revision: "63", kb: "3124263"},
+			{revision: "71", kb: "3124262"},
+			{revision: "104", kb: "3135173"},
+			{revision: "122", kb: "3140743"},
+			{revision: "164", kb: "3140768"},
+			{revision: "218", kb: "3147458"},
+			{revision: "318", kb: "3156421"},
+			{revision: "420", kb: "3163018"},
+			{revision: "494", kb: "3172985"},
+			{revision: "545", kb: "3176493"},
+			{revision: "589", kb: "3185614"},
+			{revision: "633", kb: "3192441"},
+			{revision: "679", kb: "3198586"},
+			{revision: "713", kb: "3205386"},
+			{revision: "753", kb: "3210721"},
+			{revision: "839", kb: "4013198"},
+			{revision: "873", kb: "4015219"},
+			{revision: "916", kb: "4019473"},
+			{revision: "962", kb: "4022714"},
+			{revision: "965", kb: "4032693"},
+			{revision: "1007", kb: "4025344"},
+			{revision: "1045", kb: "4034660"},
+			{revision: "1106", kb: "4038783"},
+			{revision: "1176", kb: "4041689"},
+			{revision: "1177", kb: "4052232"},
+			{revision: "1232", kb: "4048952"},
+			{revision: "1295", kb: "4053578"},
+			{revision: "1356", kb: "4056888"},
+			{revision: "1358", kb: "4075200"},
+			{revision: "1417", kb: "4074591"},
+			{revision: "1478", kb: "4088779"},
+			{revision: "1540", kb: "4093109"},
+		},
+		"14393": {
+			{revision: "10", kb: "3176929"},
+			{revision: "51", kb: "3176495"},
+			{revision: "82", kb: "3176934"},
+			{revision: "105", kb: "3176938"},
+			{revision: "187", kb: "3189866"},
+			{revision: "187", kb: "3193494"},
+			{revision: "222", kb: "3194496"},
+			{revision: "321", kb: "3194798"},
+			{revision: "351", kb: "3197954"},
+			{revision: "447", kb: "3200970"},
+			{revision: "479", kb: "3201845"},
+			{revision: "576", kb: "3206632"},
+			{revision: "693", kb: "3213986"},
+			{revision: "953", kb: "4013429"},
+			{revision: "969", kb: "4015438"},
+			{revision: "1066", kb: "4015217"},
+			{revision: "1198", kb: "4019472"},
+			{revision: "1358", kb: "4022715"},
+			{revision: "1378", kb: "4022723"},
+			{revision: "1480", kb: "4025339"},
+			{revision: "1532", kb: "4025334"},
+			{revision: "1537", kb: "4038220"},
+			{revision: "1593", kb: "4034658"},
+			{revision: "1613", kb: "4034661"},
+			{revision: "1670", kb: "4039396"},
+			{revision: "1715", kb: "4038782"},
+			{revision: "1737", kb: "4038801"},
+			{revision: "1770", kb: "4041691"},
+			{revision: "1794", kb: "4041688"},
+			{revision: "1797", kb: "4052231"},
+			{revision: "1884", kb: "4048953"},
+			{revision: "1914", kb: "4051033"},
+			{revision: "1944", kb: "4053579"},
+			{revision: "2007", kb: "4056890"},
+			{revision: "2035", kb: "4057142"},
+			{revision: "2068", kb: "4074590"},
+			{revision: "2097", kb: "4077525"},
+			{revision: "2125", kb: "4088787"},
+			{revision: "2155", kb: "4088889"},
+			{revision: "2156", kb: "4096309"},
+			{revision: "2189", kb: "4093119"},
+			{revision: "2214", kb: "4093120"},
+			{revision: "2248", kb: "4103723"},
+			{revision: "2273", kb: "4103720"},
+			{revision: "2312", kb: "4284880"},
+			{revision: "2339", kb: "4284833"},
+			{revision: "2363", kb: "4338814"},
+			{revision: "2368", kb: "4345418"},
+			{revision: "2395", kb: "4338822"},
+			{revision: "2396", kb: "4346877"},
+			{revision: "2430", kb: "4343887"},
+			{revision: "2457", kb: "4343884"},
+			{revision: "2485", kb: "4457131"},
+			{revision: "2515", kb: "4457127"},
+			{revision: "2551", kb: "4462917"},
+			{revision: "2580", kb: "4462928"},
+			{revision: "2608", kb: "4467691"},
+			{revision: "2639", kb: "4467684"},
+			{revision: "2641", kb: "4478877"},
+			{revision: "2665", kb: "4471321"},
+			{revision: "2670", kb: "4483229"},
+			{revision: "2724", kb: "4480961"},
+			{revision: "2759", kb: "4480977"},
+			{revision: "2791", kb: "4487026"},
+			{revision: "2828", kb: "4487006"},
+			{revision: "2848", kb: "4489882"},
+			{revision: "2879", kb: "4489889"},
+			{revision: "2906", kb: "4493470"},
+			{revision: "2908", kb: "4499418"},
+			{revision: "2941", kb: "4493473"},
+			{revision: "2969", kb: "4494440"},
+			{revision: "2972", kb: "4505052"},
+			{revision: "2999", kb: "4499177"},
+			{revision: "3025", kb: "4503267"},
+			{revision: "3053", kb: "4503294"},
+			{revision: "3056", kb: "4509475"},
+			{revision: "3085", kb: "4507460"},
+			{revision: "3115", kb: "4507459"},
+			{revision: "3144", kb: "4512517"},
+			{revision: "3181", kb: "4512495"},
+			{revision: "3204", kb: "4516044"},
+			{revision: "3206", kb: "4522010"},
+			{revision: "3242", kb: "4516061"},
+			{revision: "3243", kb: "4524152"},
+			{revision: "3274", kb: "4519998"},
+			{revision: "3300", kb: "4519979"},
+			{revision: "3326", kb: "4525236"},
+			{revision: "3384", kb: "4530689"},
+			{revision: "3443", kb: "4534271"},
+			{revision: "3474", kb: "4534307"},
+			{revision: "3504", kb: "4537764"},
+			{revision: "3542", kb: "4537806"},
+			{revision: "3564", kb: "4540670"},
+			{revision: "3595", kb: "4541329"},
+			{revision: "3630", kb: "4550929"},
+			{revision: "3659", kb: "4550947"},
+			{revision: "3686", kb: "4556813"},
+			{revision: "3750", kb: "4561616"},
+			{revision: "3755", kb: "4567517"},
+			{revision: "3808", kb: "4565511"},
+			{revision: "3866", kb: "4571694"},
+			{revision: "3930", kb: "4577015"},
+			{revision: "3986", kb: "4580346"},
+			{revision: "4046", kb: "4586830"},
+			{revision: "4048", kb: "4594441"},
+			{revision: "4104", kb: "4593226"},
+			{revision: "4169", kb: "4598243"},
+			{revision: "4225", kb: "4601318"},
+			{revision: "4283", kb: "5000803"},
+			{revision: "4288", kb: "5001633"},
+			{revision: "4350", kb: "5001347"},
+			{revision: "4402", kb: "5003197"},
+			{revision: "4467", kb: "5003638"},
+			{revision: "4470", kb: "5004948"},
+			{revision: "4530", kb: "5004238"},
+			{revision: "4532", kb: "5005393"},
+			{revision: "4583", kb: "5005043"},
+			{revision: "4651", kb: "5005573"},
+			{revision: "4704", kb: "5006669"},
+			{revision: "4770", kb: "5007192"},
+			{revision: "4771", kb: "5008601"},
+			{revision: "4825", kb: "5008207"},
+			{revision: "4827", kb: "5010195"},
+			{revision: "4886", kb: "5009546"},
+			{revision: "4889", kb: "5010790"},
+			{revision: "4946", kb: "5010359"},
+			{revision: "5006", kb: "5011495"},
+			{revision: "5066", kb: "5012596"},
+			{revision: "5125", kb: "5013952"},
+			{revision: "5127", kb: "5015019"},
+			{revision: "5192", kb: "5014702"},
+			{revision: "5246", kb: "5015808"},
+			{revision: "5291", kb: "5016622"},
+			{revision: "5356", kb: "5017305"},
+			{revision: "5427", kb: "5018411"},
+			{revision: "5429", kb: "5020439"},
+			{revision: "5501", kb: "5019964"},
+			{revision: "5502", kb: "5021654"},
+			{revision: "5582", kb: "5021235"},
+			{revision: "5648", kb: "5022289"},
+		},
+		"15063": {
+			{revision: "138", kb: "4015583"},
+			{revision: "250", kb: "4016240"},
+			{revision: "296", kb: "4016871"},
+			{revision: "332", kb: "4020102"},
+			{revision: "413", kb: "4022725"},
+			{revision: "447", kb: "4022716"},
+			{revision: "483", kb: "4025342"},
+			{revision: "502", kb: "4032188"},
+			{revision: "540", kb: "4034674"},
+			{revision: "608", kb: "4038788"},
+			{revision: "632", kb: "4040724"},
+			{revision: "674", kb: "4041676"},
+			{revision: "675", kb: "4049370"},
+			{revision: "726", kb: "4048954"},
+			{revision: "729", kb: "4055254"},
+			{revision: "786", kb: "4053580"},
+			{revision: "850", kb: "4056891"},
+			{revision: "877", kb: "4057144"},
+			{revision: "909", kb: "4074592"},
+			{revision: "936", kb: "4077528"},
+			{revision: "936", kb: "4092077"},
+			{revision: "966", kb: "4088782"},
+			{revision: "994", kb: "4088891"},
+			{revision: "1029", kb: "4093107"},
+			{revision: "1058", kb: "4093117"},
+			{revision: "1088", kb: "4103731"},
+			{revision: "1112", kb: "4103722"},
+			{revision: "1155", kb: "4284874"},
+			{revision: "1182", kb: "4284830"},
+			{revision: "1206", kb: "4338826"},
+			{revision: "1209", kb: "4345419"},
+			{revision: "1235", kb: "4338827"},
+			{revision: "1266", kb: "4343885"},
+			{revision: "1292", kb: "4343889"},
+			{revision: "1324", kb: "4457138"},
+			{revision: "1356", kb: "4457141"},
+			{revision: "1387", kb: "4462937"},
+			{revision: "1418", kb: "4462939"},
+			{revision: "1446", kb: "4467696"},
+			{revision: "1478", kb: "4467699"},
+			{revision: "1506", kb: "4471327"},
+			{revision: "1508", kb: "4483230"},
+			{revision: "1563", kb: "4480973"},
+			{revision: "1596", kb: "4480959"},
+			{revision: "1631", kb: "4487020"},
+			{revision: "1659", kb: "4487011"},
+			{revision: "1689", kb: "4489871"},
+			{revision: "1716", kb: "4489888"},
+			{revision: "1746", kb: "4493474"},
+			{revision: "1784", kb: "4493436"},
+			{revision: "1785", kb: "4502112"},
+			{revision: "1805", kb: "4499181"},
+			{revision: "1808", kb: "4505055"},
+			{revision: "1839", kb: "4499162"},
+			{revision: "1868", kb: "4503279"},
+			{revision: "1897", kb: "4503289"},
+			{revision: "1898", kb: "4509476"},
+			{revision: "1928", kb: "4507450"},
+			{revision: "1955", kb: "4507467"},
+			{revision: "1988", kb: "4512507"},
+			{revision: "2021", kb: "4512474"},
+			{revision: "2045", kb: "4516068"},
+			{revision: "2046", kb: "4522011"},
+			{revision: "2078", kb: "4516059"},
+			{revision: "2079", kb: "4524151"},
+			{revision: "2108", kb: "4520010"},
+		},
+		"16299": {
+			{revision: "19", kb: "4043961"},
+			{revision: "64", kb: "4048955"},
+			{revision: "98", kb: "4051963"},
+			{revision: "125", kb: "4054517"},
+			{revision: "192", kb: "4056892"},
+			{revision: "194", kb: "4073290"},
+			{revision: "201", kb: "4073291"},
+			{revision: "214", kb: "4058258"},
+			{revision: "248", kb: "4074588"},
+			{revision: "251", kb: "4090913"},
+			{revision: "309", kb: "4088776"},
+			{revision: "334", kb: "4089848"},
+			{revision: "371", kb: "4093112"},
+			{revision: "402", kb: "4093105"},
+			{revision: "431", kb: "4103727"},
+			{revision: "461", kb: "4103714"},
+			{revision: "492", kb: "4284819"},
+			{revision: "522", kb: "4284822"},
+			{revision: "547", kb: "4338825"},
+			{revision: "551", kb: "4345420"},
+			{revision: "579", kb: "4338817"},
+			{revision: "611", kb: "4343897"},
+			{revision: "637", kb: "4343893"},
+			{revision: "665", kb: "4457142"},
+			{revision: "666", kb: "4464217"},
+			{revision: "699", kb: "4457136"},
+			{revision: "726", kb: "4462918"},
+			{revision: "755", kb: "4462932"},
+			{revision: "785", kb: "4467686"},
+			{revision: "820", kb: "4467681"},
+			{revision: "846", kb: "4471329"},
+			{revision: "847", kb: "4483232"},
+			{revision: "904", kb: "4480978"},
+			{revision: "936", kb: "4480967"},
+			{revision: "967", kb: "4486996"},
+			{revision: "1004", kb: "4487021"},
+			{revision: "1029", kb: "4489886"},
+			{revision: "1059", kb: "4489890"},
+			{revision: "1087", kb: "4493441"},
+			{revision: "1127", kb: "4493440"},
+			{revision: "1146", kb: "4499179"},
+			{revision: "1150", kb: "4505062"},
+			{revision: "1182", kb: "4499147"},
+			{revision: "1217", kb: "4503284"},
+			{revision: "1237", kb: "4503281"},
+			{revision: "1239", kb: "4509477"},
+			{revision: "1268", kb: "4507455"},
+			{revision: "1296", kb: "4507465"},
+			{revision: "1331", kb: "4512516"},
+			{revision: "1365", kb: "4512494"},
+			{revision: "1387", kb: "4516066"},
+			{revision: "1392", kb: "4522012"},
+			{revision: "1420", kb: "4516071"},
+			{revision: "1421", kb: "4524150"},
+			{revision: "1451", kb: "4520004"},
+			{revision: "1481", kb: "4520006"},
+			{revision: "1508", kb: "4525241"},
+			{revision: "1565", kb: "4530714"},
+			{revision: "1625", kb: "4534276"},
+			{revision: "1654", kb: "4534318"},
+			{revision: "1686", kb: "4537789"},
+			{revision: "1717", kb: "4537816"},
+			{revision: "1747", kb: "4540681"},
+			{revision: "1775", kb: "4541330"},
+			{revision: "1776", kb: "4554342"},
+			{revision: "1806", kb: "4550927"},
+			{revision: "1868", kb: "4556812"},
+			{revision: "1932", kb: "4561602"},
+			{revision: "1937", kb: "4567515"},
+			{revision: "1992", kb: "4565508"},
+			{revision: "2045", kb: "4571741"},
+			{revision: "2107", kb: "4577041"},
+			{revision: "2166", kb: "4580328"},
+		},
+		"17134": {
+			{revision: "48", kb: "4103721"},
+			{revision: "81", kb: "4100403"},
+			{revision: "83", kb: "4338548"},
+			{revision: "112", kb: "4284835"},
+			{revision: "137", kb: "4284848"},
+			{revision: "165", kb: "4338819"},
+			{revision: "167", kb: "4345421"},
+			{revision: "191", kb: "4340917"},
+			{revision: "228", kb: "4343909"},
+			{revision: "254", kb: "4346783"},
+			{revision: "285", kb: "4457128"},
+			{revision: "286", kb: "4464218"},
+			{revision: "320", kb: "4458469"},
+			{revision: "345", kb: "4462919"},
+			{revision: "376", kb: "4462933"},
+			{revision: "407", kb: "4467702"},
+			{revision: "441", kb: "4467682"},
+			{revision: "471", kb: "4471324"},
+			{revision: "472", kb: "4483234"},
+			{revision: "523", kb: "4480966"},
+			{revision: "556", kb: "4480976"},
+			{revision: "590", kb: "4487017"},
+			{revision: "619", kb: "4487029"},
+			{revision: "648", kb: "4489868"},
+			{revision: "677", kb: "4489894"},
+			{revision: "706", kb: "4493464"},
+			{revision: "753", kb: "4493437"},
+			{revision: "765", kb: "4499167"},
+			{revision: "766", kb: "4505064"},
+			{revision: "799", kb: "4499183"},
+			{revision: "829", kb: "4503286"},
+			{revision: "858", kb: "4503288"},
+			{revision: "860", kb: "4509478"},
+			{revision: "885", kb: "4507435"},
+			{revision: "915", kb: "4507466"},
+			{revision: "950", kb: "4512501"},
+			{revision: "984", kb: "4512509"},
+			{revision: "1006", kb: "4516058"},
+			{revision: "1009", kb: "4522014"},
+			{revision: "1039", kb: "4516045"},
+			{revision: "1040", kb: "4524149"},
+			{revision: "1069", kb: "4520008"},
+			{revision: "1099", kb: "4519978"},
+			{revision: "1130", kb: "4525237"},
+			{revision: "1184", kb: "4530717"},
+			{revision: "1246", kb: "4534293"},
+			{revision: "1276", kb: "4534308"},
+			{revision: "1304", kb: "4537762"},
+			{revision: "1345", kb: "4537795"},
+			{revision: "1365", kb: "4540689"},
+			{revision: "1399", kb: "4541333"},
+			{revision: "1401", kb: "4554349"},
+			{revision: "1425", kb: "4550922"},
+			{revision: "1456", kb: "4550944"},
+			{revision: "1488", kb: "4556807"},
+			{revision: "1550", kb: "4561621"},
+			{revision: "1553", kb: "4567514"},
+			{revision: "1610", kb: "4565489"},
+			{revision: "1667", kb: "4571709"},
+			{revision: "1726", kb: "4577032"},
+			{revision: "1792", kb: "4580330"},
+			{revision: "1845", kb: "4586785"},
+			{revision: "1902", kb: "4592446"},
+			{revision: "1967", kb: "4598245"},
+			{revision: "2026", kb: "4601354"},
+			{revision: "2087", kb: "5000809"},
+			{revision: "2088", kb: "5001565"},
+			{revision: "2090", kb: "5001634"},
+			{revision: "2145", kb: "5001339"},
+			{revision: "2208", kb: "5003174"},
+		},
+		"17763": {
+			{revision: "1", kb: ""},
+			{revision: "55", kb: "4464330"},
+			{revision: "107", kb: "4464455"},
+			{revision: "134", kb: "4467708"},
+			{revision: "168", kb: "4469342"},
+			{revision: "194", kb: "4471332"},
+			{revision: "195", kb: "4483235"},
+			{revision: "253", kb: "4480116"},
+			{revision: "292", kb: "4476976"},
+			{revision: "316", kb: "4487044"},
+			{revision: "348", kb: "4482887"},
+			{revision: "379", kb: "4489899"},
+			{revision: "404", kb: "4490481"},
+			{revision: "437", kb: "4493509"},
+			{revision: "439", kb: "4501835"},
+			{revision: "475", kb: "4495667"},
+			{revision: "503", kb: "4494441"},
+			{revision: "504", kb: "4505056"},
+			{revision: "529", kb: "4497934"},
+			{revision: "557", kb: "4503327"},
+			{revision: "592", kb: "4501371"},
+			{revision: "593", kb: "4509479"},
+			{revision: "615", kb: "4507469"},
+			{revision: "652", kb: "4505658"},
+			{revision: "678", kb: "4511553"},
+			{revision: "720", kb: "4512534"},
+			{revision: "737", kb: "4512578"},
+			{revision: "740", kb: "4522015"},
+			{revision: "774", kb: "4516077"},
+			{revision: "775", kb: "4524148"},
+			{revision: "805", kb: "4519338"},
+			{revision: "832", kb: "4520062"},
+			{revision: "864", kb: "4523205"},
+			{revision: "914", kb: "4530715"},
+			{revision: "973", kb: "4534273"},
+			{revision: "1012", kb: "4534321"},
+			{revision: "1039", kb: "4532691"},
+			{revision: "1075", kb: "4537818"},
+			{revision: "1098", kb: "4538461"},
+			{revision: "1131", kb: "4541331"},
+			{revision: "1132", kb: "4554354"},
+			{revision: "1158", kb: "4549949"},
+			{revision: "1192", kb: "4550969"},
+			{revision: "1217", kb: "4551853"},
+			{revision: "1282", kb: "4561608"},
+			{revision: "1294", kb: "4567513"},
+			{revision: "1339", kb: "4558998"},
+			{revision: "1369", kb: "4559003"},
+			{revision: "1397", kb: "4565349"},
+			{revision: "1432", kb: "4571748"},
+			{revision: "1457", kb: "4570333"},
+			{revision: "1490", kb: "4577069"},
+			{revision: "1518", kb: "4577668"},
+			{revision: "1554", kb: "4580390"},
+			{revision: "1577", kb: "4586793"},
+			{revision: "1579", kb: "4594442"},
+			{revision: "1613", kb: "4586839"},
+			{revision: "1637", kb: "4592440"},
+			{revision: "1697", kb: "4598230"},
+			{revision: "1728", kb: "4598296"},
+			{revision: "1757", kb: "4601345"},
+			{revision: "1790", kb: "4601383"},
+			{revision: "1817", kb: "5000822"},
+			{revision: "1821", kb: "5001568"},
+			{revision: "1823", kb: "5001638"},
+			{revision: "1852", kb: "5000854"},
+			{revision: "1879", kb: "5001342"},
+			{revision: "1911", kb: "5001384"},
+			{revision: "1935", kb: "5003171"},
+			{revision: "1971", kb: "5003217"},
+			{revision: "1999", kb: "5003646"},
+			{revision: "2028", kb: "5003703"},
+			{revision: "2029", kb: "5004947"},
+			{revision: "2061", kb: "5004244"},
+			{revision: "2090", kb: "5004308"},
+			{revision: "2091", kb: "5005394"},
+			{revision: "2114", kb: "5005030"},
+			{revision: "2145", kb: "5005102"},
+			{revision: "2183", kb: "5005568"},
+			{revision: "2213", kb: "5005625"},
+			{revision: "2237", kb: "5006672"},
+			{revision: "2268", kb: "5006744"},
+			{revision: "2300", kb: "5007206"},
+			{revision: "2305", kb: "5008602"},
+			{revision: "2330", kb: "5007266"},
+			{revision: "2366", kb: "5008218"},
+			{revision: "2369", kb: "5010196"},
+			{revision: "2452", kb: "5009557"},
+			{revision: "2458", kb: "5010791"},
+			{revision: "2510", kb: "5009616"},
+			{revision: "2565", kb: "5010351"},
+			{revision: "2628", kb: "5010427"},
+			{revision: "2686", kb: "5011503"},
+			{revision: "2746", kb: "5011551"},
+			{revision: "2803", kb: "5012647"},
+			{revision: "2867", kb: "5012636"},
+			{revision: "2928", kb: "5013941"},
+			{revision: "2931", kb: "5015018"},
+			{revision: "2989", kb: "5014022"},
+			{revision: "3046", kb: "5014692"},
+			{revision: "3113", kb: "5014669"},
+			{revision: "3165", kb: "5015811"},
+			{revision: "3232", kb: "5015880"},
+			{revision: "3287", kb: "5016623"},
+			{revision: "3346", kb: "5016690"},
+			{revision: "3406", kb: "5017315"},
+			{revision: "3469", kb: "5017379"},
+			{revision: "3532", kb: "5018419"},
+			{revision: "3534", kb: "5020438"},
+			{revision: "3650", kb: "5019966"},
+			{revision: "3653", kb: "5021655"},
+			{revision: "3770", kb: "5021237"},
+			{revision: "3772", kb: "5022554"},
+			{revision: "3887", kb: "5022286"},
+			{revision: "4010", kb: "5022840"},
+		},
+		"18362": {
+			{revision: "116", kb: "4505057"},
+			{revision: "145", kb: "4497935"},
+			{revision: "175", kb: "4503293"},
+			{revision: "207", kb: "4501375"},
+			{revision: "239", kb: "4507453"},
+			{revision: "267", kb: "4505903"},
+			{revision: "295", kb: "4512508"},
+			{revision: "329", kb: "4512941"},
+			{revision: "356", kb: "4515384"},
+			{revision: "357", kb: "4522016"},
+			{revision: "387", kb: "4517211"},
+			{revision: "388", kb: "4524147"},
+			{revision: "418", kb: "4517389"},
+			{revision: "449", kb: "4522355"},
+			{revision: "476", kb: "4524570"},
+			{revision: "535", kb: "4530684"},
+			{revision: "592", kb: "4528760"},
+			{revision: "628", kb: "4532695"},
+			{revision: "657", kb: "4532693"},
+			{revision: "693", kb: "4535996"},
+			{revision: "719", kb: "4540673"},
+			{revision: "720", kb: "4551762"},
+			{revision: "752", kb: "4541335"},
+			{revision: "753", kb: "4554364"},
+			{revision: "778", kb: "4549951"},
+			{revision: "815", kb: "4550945"},
+			{revision: "836", kb: "4556799"},
+			{revision: "900", kb: "4560960"},
+			{revision: "904", kb: "4567512"},
+			{revision: "959", kb: "4565483"},
+			{revision: "997", kb: "4559004"},
+			{revision: "1016", kb: "4565351"},
+			{revision: "1049", kb: "4566116"},
+			{revision: "1082", kb: "4574727"},
+			{revision: "1110", kb: "4577062"},
+			{revision: "1139", kb: "4577671"},
+			{revision: "1171", kb: "4580386"},
+			{revision: "1198", kb: "4586786"},
+			{revision: "1199", kb: "4594443"},
+			{revision: "1237", kb: "4586819"},
+			{revision: "1256", kb: "4592449"},
+		},
+		"18363": {
+			{revision: "476", kb: "4524570"},
+			{revision: "535", kb: "4530684"},
+			{revision: "592", kb: "4528760"},
+			{revision: "628", kb: "4532695"},
+			{revision: "657", kb: "4532693"},
+			{revision: "693", kb: "4535996"},
+			{revision: "719", kb: "4540673"},
+			{revision: "720", kb: "4551762"},
+			{revision: "752", kb: "4541335"},
+			{revision: "753", kb: "4554364"},
+			{revision: "778", kb: "4549951"},
+			{revision: "815", kb: "4550945"},
+			{revision: "836", kb: "4556799"},
+			{revision: "900", kb: "4560960"},
+			{revision: "904", kb: "4567512"},
+			{revision: "959", kb: "4565483"},
+			{revision: "997", kb: "4559004"},
+			{revision: "1016", kb: "4565351"},
+			{revision: "1049", kb: "4566116"},
+			{revision: "1082", kb: "4574727"},
+			{revision: "1110", kb: "4577062"},
+			{revision: "1139", kb: "4577671"},
+			{revision: "1171", kb: "4580386"},
+			{revision: "1198", kb: "4586786"},
+			{revision: "1199", kb: "4594443"},
+			{revision: "1237", kb: "4586819"},
+			{revision: "1256", kb: "4592449"},
+			{revision: "1316", kb: "4598229"},
+			{revision: "1350", kb: "4598298"},
+			{revision: "1377", kb: "4601315"},
+			{revision: "1379", kb: "5001028"},
+			{revision: "1411", kb: "4601380"},
+			{revision: "1440", kb: "5000808"},
+			{revision: "1441", kb: "5001566"},
+			{revision: "1443", kb: "5001648"},
+			{revision: "1474", kb: "5000850"},
+			{revision: "1500", kb: "5001337"},
+			{revision: "1533", kb: "5001396"},
+			{revision: "1556", kb: "5003169"},
+			{revision: "1593", kb: "5003212"},
+			{revision: "1621", kb: "5003635"},
+			{revision: "1645", kb: "5003698"},
+			{revision: "1646", kb: "5004946"},
+			{revision: "1679", kb: "5004245"},
+			{revision: "1714", kb: "5004293"},
+			{revision: "1734", kb: "5005031"},
+			{revision: "1766", kb: "5005103"},
+			{revision: "1801", kb: "5005566"},
+			{revision: "1832", kb: "5005624"},
+			{revision: "1854", kb: "5006667"},
+			{revision: "1916", kb: "5007189"},
+			{revision: "1977", kb: "5008206"},
+			{revision: "2037", kb: "5009545"},
+			{revision: "2039", kb: "5010792"},
+			{revision: "2094", kb: "5010345"},
+			{revision: "2158", kb: "5011485"},
+			{revision: "2212", kb: "5012591"},
+			{revision: "2274", kb: "5013945"},
+		},
+		"19041": {
+			{revision: "264", kb: ""},
+			{revision: "329", kb: "4557957"},
+			{revision: "331", kb: "4567523"},
+			{revision: "388", kb: "4565503"},
+			{revision: "423", kb: "4568831"},
+			{revision: "450", kb: "4566782"},
+			{revision: "488", kb: "4571744"},
+			{revision: "508", kb: "4571756"},
+			{revision: "546", kb: "4577063"},
+			{revision: "572", kb: "4579311"},
+			{revision: "610", kb: "4580364"},
+			{revision: "630", kb: "4586781"},
+			{revision: "631", kb: "4594440"},
+			{revision: "662", kb: "4586853"},
+			{revision: "685", kb: "4592438"},
+			{revision: "746", kb: "4598242"},
+			{revision: "789", kb: "4598291"},
+			{revision: "804", kb: "4601319"},
+			{revision: "844", kb: "4601382"},
+			{revision: "867", kb: "5000802"},
+			{revision: "868", kb: "5001567"},
+			{revision: "870", kb: "5001649"},
+			{revision: "906", kb: "5000842"},
+			{revision: "928", kb: "5001330"},
+			{revision: "964", kb: "5001391"},
+			{revision: "985", kb: "5003173"},
+			{revision: "1023", kb: "5003214"},
+			{revision: "1052", kb: "5003637"},
+			{revision: "1055", kb: "5004476"},
+			{revision: "1081", kb: "5003690"},
+			{revision: "1082", kb: "5004760"},
+			{revision: "1083", kb: "5004945"},
+			{revision: "1110", kb: "5004237"},
+			{revision: "1151", kb: "5004296"},
+			{revision: "1165", kb: "5005033"},
+			{revision: "1202", kb: "5005101"},
+			{revision: "1237", kb: "5005565"},
+			{revision: "1266", kb: "5005611"},
+			{revision: "1288", kb: "5006670"},
+			{revision: "1320", kb: "5006738"},
+			{revision: "1348", kb: "5007186"},
+			{revision: "1387", kb: "5007253"},
+			{revision: "1415", kb: "5008212"},
+		},
+		"19042": {
+			{revision: "572", kb: ""},
+			{revision: "610", kb: "4580364"},
+			{revision: "630", kb: "4586781"},
+			{revision: "631", kb: "4594440"},
+			{revision: "662", kb: "4586853"},
+			{revision: "685", kb: "4592438"},
+			{revision: "746", kb: "4598242"},
+			{revision: "789", kb: "4598291"},
+			{revision: "804", kb: "4601319"},
+			{revision: "844", kb: "4601382"},
+			{revision: "867", kb: "5000802"},
+			{revision: "868", kb: "5001567"},
+			{revision: "870", kb: "5001649"},
+			{revision: "906", kb: "5000842"},
+			{revision: "928", kb: "5001330"},
+			{revision: "964", kb: "5001391"},
+			{revision: "985", kb: "5003173"},
+			{revision: "1023", kb: "5003214"},
+			{revision: "1052", kb: "5003637"},
+			{revision: "1055", kb: "5004476"},
+			{revision: "1081", kb: "5003690"},
+			{revision: "1082", kb: "5004760"},
+			{revision: "1083", kb: "5004945"},
+			{revision: "1110", kb: "5004237"},
+			{revision: "1151", kb: "5004296"},
+			{revision: "1165", kb: "5005033"},
+			{revision: "1202", kb: "5005101"},
+			{revision: "1237", kb: "5005565"},
+			{revision: "1266", kb: "5005611"},
+			{revision: "1288", kb: "5006670"},
+			{revision: "1320", kb: "5006738"},
+			{revision: "1348", kb: "5007186"},
+			{revision: "1387", kb: "5007253"},
+			{revision: "1415", kb: "5008212"},
+			{revision: "1466", kb: "5009543"},
+			{revision: "1469", kb: "5010793"},
+			{revision: "1503", kb: "5009596"},
+			{revision: "1526", kb: "5010342"},
+			{revision: "1566", kb: "5010415"},
+			{revision: "1586", kb: "5011487"},
+			{revision: "1620", kb: "5011543"},
+			{revision: "1645", kb: "5012599"},
+			{revision: "1682", kb: "5011831"},
+			{revision: "1706", kb: "5013942"},
+			{revision: "1708", kb: "5015020"},
+			{revision: "1741", kb: "5014023"},
+			{revision: "1766", kb: "5014699"},
+			{revision: "1767", kb: "5016139"},
+			{revision: "1806", kb: "5014666"},
+			{revision: "1826", kb: "5015807"},
+			{revision: "1865", kb: "5015878"},
+			{revision: "1889", kb: "5016616"},
+			{revision: "1949", kb: "5016688"},
+			{revision: "2006", kb: "5017308"},
+			{revision: "2075", kb: "5017380"},
+			{revision: "2130", kb: "5018410"},
+			{revision: "2132", kb: "5020435"},
+			{revision: "2193", kb: "5018482"},
+			{revision: "2194", kb: "5020953"},
+			{revision: "2251", kb: "5019959"},
+			{revision: "2311", kb: "5020030"},
+			{revision: "2364", kb: "5021233"},
+			{revision: "2486", kb: "5022282"},
+			{revision: "2546", kb: "5019275"},
+			{revision: "2604", kb: "5022834"},
+		},
+		"19043": {
+			{revision: "985", kb: "5003173"},
+			{revision: "1023", kb: "5003214"},
+			{revision: "1052", kb: "5003637"},
+			{revision: "1055", kb: "5004476"},
+			{revision: "1081", kb: "5003690"},
+			{revision: "1082", kb: "5004760"},
+			{revision: "1083", kb: "5004945"},
+			{revision: "1110", kb: "5004237"},
+			{revision: "1151", kb: "5004296"},
+			{revision: "1165", kb: "5005033"},
+			{revision: "1202", kb: "5005101"},
+			{revision: "1237", kb: "5005565"},
+			{revision: "1266", kb: "5005611"},
+			{revision: "1288", kb: "5006670"},
+			{revision: "1320", kb: "5006738"},
+			{revision: "1348", kb: "5007186"},
+			{revision: "1387", kb: "5007253"},
+			{revision: "1415", kb: "5008212"},
+			{revision: "1466", kb: "5009543"},
+			{revision: "1469", kb: "5010793"},
+			{revision: "1503", kb: "5009596"},
+			{revision: "1526", kb: "5010342"},
+			{revision: "1566", kb: "5010415"},
+			{revision: "1586", kb: "5011487"},
+			{revision: "1620", kb: "5011543"},
+			{revision: "1645", kb: "5012599"},
+			{revision: "1682", kb: "5011831"},
+			{revision: "1706", kb: "5013942"},
+			{revision: "1708", kb: "5015020"},
+			{revision: "1741", kb: "5014023"},
+			{revision: "1766", kb: "5014699"},
+			{revision: "1767", kb: "5016139"},
+			{revision: "1806", kb: "5014666"},
+			{revision: "1826", kb: "5015807"},
+			{revision: "1865", kb: "5015878"},
+			{revision: "1889", kb: "5016616"},
+			{revision: "1949", kb: "5016688"},
+			{revision: "2006", kb: "5017308"},
+			{revision: "2075", kb: "5017380"},
+			{revision: "2130", kb: "5018410"},
+			{revision: "2132", kb: "5020435"},
+			{revision: "2193", kb: "5018482"},
+			{revision: "2194", kb: "5020953"},
+			{revision: "2251", kb: "5019959"},
+			{revision: "2311", kb: "5020030"},
+			{revision: "2364", kb: "5021233"},
+		},
+		"19044": {
+			{revision: "1288", kb: ""},
+			{revision: "1387", kb: "5007253"},
+			{revision: "1415", kb: "5008212"},
+			{revision: "1466", kb: "5009543"},
+			{revision: "1469", kb: "5010793"},
+			{revision: "1503", kb: "5009596"},
+			{revision: "1526", kb: "5010342"},
+			{revision: "1566", kb: "5010415"},
+			{revision: "1586", kb: "5011487"},
+			{revision: "1620", kb: "5011543"},
+			{revision: "1645", kb: "5012599"},
+			{revision: "1682", kb: "5011831"},
+			{revision: "1706", kb: "5013942"},
+			{revision: "1708", kb: "5015020"},
+			{revision: "1741", kb: "5014023"},
+			{revision: "1766", kb: "5014699"},
+			{revision: "1767", kb: "5016139"},
+			{revision: "1806", kb: "5014666"},
+			{revision: "1826", kb: "5015807"},
+			{revision: "1865", kb: "5015878"},
+			{revision: "1889", kb: "5016616"},
+			{revision: "1949", kb: "5016688"},
+			{revision: "2006", kb: "5017308"},
+			{revision: "2075", kb: "5017380"},
+			{revision: "2130", kb: "5018410"},
+			{revision: "2132", kb: "5020435"},
+			{revision: "2193", kb: "5018482"},
+			{revision: "2194", kb: "5020953"},
+			{revision: "2251", kb: "5019959"},
+			{revision: "2311", kb: "5020030"},
+			{revision: "2364", kb: "5021233"},
+			{revision: "2486", kb: "5022282"},
+			{revision: "2546", kb: "5019275"},
+			{revision: "2604", kb: "5022834"},
+		},
+		"19045": {
+			{revision: "2130", kb: ""},
+			{revision: "2251", kb: "5019959"},
+			{revision: "2311", kb: "5020030"},
+			{revision: "2364", kb: "5021233"},
+			{revision: "2486", kb: "5022282"},
+			{revision: "2546", kb: "5019275"},
+			{revision: "2604", kb: "5022834"},
+		},
+	},
+	// https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information
+	"11": {
+		"22000": {
+			{revision: "194", kb: ""},
+			{revision: "258", kb: "5006674"},
+			{revision: "282", kb: "5006746"},
+			{revision: "318", kb: "5007215"},
+			{revision: "348", kb: "5007262"},
+			{revision: "376", kb: "5008215"},
+			{revision: "434", kb: "5009566"},
+			{revision: "438", kb: "5010795"},
+			{revision: "469", kb: "5008353"},
+			{revision: "493", kb: "5010386"},
+			{revision: "527", kb: "5010414"},
+			{revision: "556", kb: "5011493"},
+			{revision: "593", kb: "5011563"},
+			{revision: "613", kb: "5012592"},
+			{revision: "652", kb: "5012643"},
+			{revision: "675", kb: "5013943"},
+			{revision: "708", kb: "5014019"},
+			{revision: "739", kb: "5014697"},
+			{revision: "740", kb: "5016138"},
+			{revision: "778", kb: "5014668"},
+			{revision: "795", kb: "5015814"},
+			{revision: "832", kb: "5015882"},
+			{revision: "856", kb: "5016629"},
+			{revision: "918", kb: "5016691"},
+			{revision: "978", kb: "5017328"},
+			{revision: "1042", kb: "5017383"},
+			{revision: "1098", kb: "5018418"},
+			{revision: "1100", kb: "5020387"},
+			{revision: "1165", kb: "5018483"},
+			{revision: "1219", kb: "5019961"},
+			{revision: "1281", kb: "5019157"},
+			{revision: "1335", kb: "5021234"},
+			{revision: "1455", kb: "5022287"},
+			{revision: "1516", kb: "5019274"},
+		},
+		"22621": {
+			{revision: "521", kb: ""},
+			{revision: "525", kb: "5019311"},
+			{revision: "608", kb: "5017389"},
+			{revision: "674", kb: "5018427"},
+			{revision: "675", kb: "5019509"},
+			{revision: "755", kb: "5018496"},
+			{revision: "819", kb: "5019980"},
+			{revision: "900", kb: "5020044"},
+			{revision: "963", kb: "5021255"},
+			{revision: "1105", kb: "5022303"},
+			{revision: "1194", kb: "5022360"},
+		},
+	},
+}
+
+func (o *windows) detectKernelVersion(applied []string) (string, error) {
+	switch ss := strings.Split(o.Kernel.Version, "."); len(ss) {
+	case 3:
+		switch {
+		case strings.HasPrefix(o.getDistro().Release, "Windows 10"), strings.HasPrefix(o.getDistro().Release, "Windows 11"):
+			osver := strings.Split(o.getDistro().Release, " ")[1]
+
+			verReleases, ok := windowsReleases[osver]
+			if !ok {
+				return o.Kernel.Version, nil
+			}
+
+			rels, ok := verReleases[ss[2]]
+			if !ok {
+				return o.Kernel.Version, nil
+			}
+
+			var revs []string
+			for _, r := range rels {
+				if slices.Contains(applied, r.kb) {
+					revs = append(revs, r.revision)
+				}
+			}
+			slices.SortFunc(revs, func(i, j string) bool {
+				ni, _ := strconv.Atoi(i)
+				nj, _ := strconv.Atoi(j)
+				return ni < nj
+			})
+
+			return fmt.Sprintf("%s.%s", o.Kernel.Version, revs[len(revs)-1]), nil
+		default:
+			return o.Kernel.Version, nil
+		}
+	case 4:
+		return o.Kernel.Version, nil
+	default:
+		return "", xerrors.Errorf("unexpected kernel version. expected: <major version>.<minor version>.<build>(.<revision>), actual: %s", o.Kernel.Version)
+	}
+}
+
+func (o *windows) detectKBsFromKernelVersion() (models.WindowsKB, error) {
+	switch ss := strings.Split(o.Kernel.Version, "."); len(ss) {
+	case 3:
+		return models.WindowsKB{}, nil
+	case 4:
+		switch {
+		case strings.HasPrefix(o.getDistro().Release, "Windows 10 "), strings.HasPrefix(o.getDistro().Release, "Windows 11 "):
+			osver := strings.Split(o.getDistro().Release, " ")[1]
+
+			verReleases, ok := windowsReleases[osver]
+			if !ok {
+				return models.WindowsKB{}, nil
+			}
+
+			rels, ok := verReleases[ss[2]]
+			if !ok {
+				return models.WindowsKB{}, nil
+			}
+
+			nMyRevision, err := strconv.Atoi(ss[3])
+			if err != nil {
+				return models.WindowsKB{}, xerrors.Errorf("Failed to parse revision number. err: %w", err)
+			}
+
+			var index int
+			for i, r := range rels {
+				nRevision, err := strconv.Atoi(r.revision)
+				if err != nil {
+					return models.WindowsKB{}, xerrors.Errorf("Failed to parse revision number. err: %w", err)
+				}
+				if nMyRevision < nRevision {
+					break
+				}
+				index = i
+			}
+
+			var kbs models.WindowsKB
+			for _, r := range rels[:index+1] {
+				if r.kb != "" {
+					kbs.Applied = append(kbs.Applied, r.kb)
+				}
+			}
+			for _, r := range rels[index+1:] {
+				if r.kb != "" {
+					kbs.Unapplied = append(kbs.Unapplied, r.kb)
+				}
+			}
+
+			return kbs, nil
+		default:
+			return models.WindowsKB{}, nil
+		}
+	default:
+		return models.WindowsKB{}, xerrors.Errorf("unexpected kernel version. expected: <major version>.<minor version>.<build>(.<revision>), actual: %s", o.Kernel.Version)
+	}
 }
 
 func (o *windows) detectPlatform() {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	ex "os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -161,7 +162,6 @@ func localExec(c config.ServerInfo, cmdstr string, sudo bool) (result execResult
 	var stdoutBuf, stderrBuf bytes.Buffer
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
-
 	if err := cmd.Run(); err != nil {
 		result.Error = err
 		if exitError, ok := err.(*ex.ExitError); ok {
@@ -173,17 +173,19 @@ func localExec(c config.ServerInfo, cmdstr string, sudo bool) (result execResult
 	} else {
 		result.ExitStatus = 0
 	}
-
 	result.Stdout = stdoutBuf.String()
 	result.Stderr = stderrBuf.String()
 	result.Cmd = strings.Replace(cmdstr, "\n", "", -1)
 	return
 }
 
-func sshExecExternal(c config.ServerInfo, cmd string, sudo bool) (result execResult) {
+func sshExecExternal(c config.ServerInfo, cmdstr string, sudo bool) (result execResult) {
 	sshBinaryPath, err := ex.LookPath("ssh")
 	if err != nil {
 		return execResult{Error: err}
+	}
+	if runtime.GOOS == "windows" {
+		sshBinaryPath = "ssh.exe"
 	}
 
 	var args []string
@@ -191,24 +193,27 @@ func sshExecExternal(c config.ServerInfo, cmd string, sudo bool) (result execRes
 	if c.SSHConfigPath != "" {
 		args = append(args, "-F", c.SSHConfigPath)
 	} else {
-		home, err := homedir.Dir()
-		if err != nil {
-			msg := fmt.Sprintf("Failed to get HOME directory: %s", err)
-			result.Stderr = msg
-			result.ExitStatus = 997
-			return
-		}
-		controlPath := filepath.Join(home, ".vuls", `controlmaster-%r-`+c.ServerName+`.%p`)
-
 		args = append(args,
 			"-o", "StrictHostKeyChecking=yes",
 			"-o", "LogLevel=quiet",
 			"-o", "ConnectionAttempts=3",
 			"-o", "ConnectTimeout=10",
-			"-o", "ControlMaster=auto",
-			"-o", fmt.Sprintf("ControlPath=%s", controlPath),
-			"-o", "Controlpersist=10m",
 		)
+		if runtime.GOOS != "windows" {
+			home, err := homedir.Dir()
+			if err != nil {
+				msg := fmt.Sprintf("Failed to get HOME directory: %s", err)
+				result.Stderr = msg
+				result.ExitStatus = 997
+				return
+			}
+
+			controlPath := filepath.Join(home, ".vuls", `controlmaster-%r-`+c.ServerName+`.%p`)
+			args = append(args,
+				"-o", "ControlMaster=auto",
+				"-o", fmt.Sprintf("ControlPath=%s", controlPath),
+				"-o", "Controlpersist=10m")
+		}
 	}
 
 	if config.Conf.Vvv {
@@ -229,21 +234,18 @@ func sshExecExternal(c config.ServerInfo, cmd string, sudo bool) (result execRes
 	}
 	args = append(args, c.Host)
 
-	cmd = decorateCmd(c, cmd, sudo)
+	cmdstr = decorateCmd(c, cmdstr, sudo)
+	var cmd *ex.Cmd
 	switch c.Distro.Family {
 	case constant.Windows:
-		cmd = fmt.Sprintf("powershell.exe -NoProfile -NonInteractive %s", cmd)
+		cmd = ex.Command(sshBinaryPath, append(args, "powershell.exe", "-NoProfile", "-NonInteractive", cmdstr)...)
 	default:
-		cmd = fmt.Sprintf("stty cols 1000; %s", cmd)
+		cmd = ex.Command(sshBinaryPath, append(args, fmt.Sprintf("stty cols 1000; %s", cmdstr))...)
 	}
-
-	args = append(args, cmd)
-	execCmd := ex.Command(sshBinaryPath, args...)
-
 	var stdoutBuf, stderrBuf bytes.Buffer
-	execCmd.Stdout = &stdoutBuf
-	execCmd.Stderr = &stderrBuf
-	if err := execCmd.Run(); err != nil {
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Run(); err != nil {
 		if e, ok := err.(*ex.ExitError); ok {
 			if s, ok := e.Sys().(syscall.WaitStatus); ok {
 				result.ExitStatus = s.ExitStatus()
@@ -256,7 +258,6 @@ func sshExecExternal(c config.ServerInfo, cmd string, sudo bool) (result execRes
 	} else {
 		result.ExitStatus = 0
 	}
-
 	result.Stdout = stdoutBuf.String()
 	result.Stderr = stderrBuf.String()
 	result.Servername = c.ServerName

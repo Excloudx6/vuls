@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"os"
 	ex "os/exec"
+	"runtime"
 	"strings"
 	"time"
 
 	debver "github.com/knqyf263/go-deb-version"
+	"golang.org/x/exp/maps"
 	"golang.org/x/xerrors"
 
 	"github.com/future-architect/vuls/cache"
@@ -161,15 +163,60 @@ func ViaHTTP(header http.Header, body string, toLocalFile bool) (models.ScanResu
 
 	switch family {
 	case constant.Windows:
-		release, applied, err := parseSystemInfo(body)
+		osInfo, hotfixs, err := parseSystemInfo(body)
 		if err != nil {
-			return models.ScanResult{}, err
+			return models.ScanResult{}, xerrors.Errorf("Failed to parse systeminfo.exe. err: %w", err)
 		}
+
+		release, err := detectOSName(osInfo)
+		if err != nil {
+			return models.ScanResult{}, xerrors.Errorf("Failed to detect os name. err: %w", err)
+		}
+
+		kernelVersion := header.Get("X-Vuls-Kernel-Version")
+		if kernelVersion == "" {
+			kernelVersion = formatKernelVersion(osInfo)
+		}
+
+		w := &windows{
+			base: base{
+				Distro: config.Distro{Family: family, Release: release},
+				osPackages: osPackages{
+					Kernel: models.Kernel{Version: kernelVersion},
+				},
+				log: logging.Log,
+			},
+		}
+		v, err := w.detectKernelVersion(hotfixs)
+		if err != nil {
+			return models.ScanResult{}, xerrors.Errorf("Failed to detect kernel version. err: %w", err)
+		}
+		w.Kernel = models.Kernel{Version: v}
+
+		kbs, err := w.detectKBsFromKernelVersion()
+		if err != nil {
+			return models.ScanResult{}, xerrors.Errorf("Failed to detect KBs from kernel version. err: %w", err)
+		}
+
+		applied, unapplied := map[string]struct{}{}, map[string]struct{}{}
+		for _, kb := range hotfixs {
+			applied[kb] = struct{}{}
+		}
+		for _, kb := range kbs.Applied {
+			applied[kb] = struct{}{}
+		}
+		for _, kb := range kbs.Unapplied {
+			unapplied[kb] = struct{}{}
+		}
+
 		return models.ScanResult{
-			ServerName:  serverName,
-			Family:      family,
-			Release:     release,
-			WindowsKB:   &models.WindowsKB{Applied: applied},
+			ServerName: serverName,
+			Family:     family,
+			Release:    release,
+			RunningKernel: models.Kernel{
+				Version: v,
+			},
+			WindowsKB:   &models.WindowsKB{Applied: maps.Keys(applied), Unapplied: maps.Keys(unapplied)},
 			ScannedCves: models.VulnInfos{},
 		}, nil
 	default:
@@ -357,7 +404,14 @@ func validateSSHConfig(c *config.ServerInfo) error {
 
 	logging.Log.Debugf("Validating SSH Settings for Server:%s ...", c.GetServerName())
 
-	sshBinaryPath, err := ex.LookPath("ssh")
+	if runtime.GOOS == "windows" {
+		c.Distro.Family = constant.Windows
+	}
+	defer func(c *config.ServerInfo) {
+		c.Distro.Family = ""
+	}(c)
+
+	sshBinaryPath, err := lookpath(c.Distro.Family, "ssh")
 	if err != nil {
 		return xerrors.Errorf("Failed to lookup ssh binary path. err: %w", err)
 	}
@@ -396,7 +450,7 @@ func validateSSHConfig(c *config.ServerInfo) error {
 		return xerrors.New("Failed to find any known_hosts to use. Please check the UserKnownHostsFile and GlobalKnownHostsFile settings for SSH")
 	}
 
-	sshKeyscanBinaryPath, err := ex.LookPath("ssh-keyscan")
+	sshKeyscanBinaryPath, err := lookpath(c.Distro.Family, "ssh-keyscan")
 	if err != nil {
 		return xerrors.Errorf("Failed to lookup ssh-keyscan binary path. err: %w", err)
 	}
@@ -407,7 +461,7 @@ func validateSSHConfig(c *config.ServerInfo) error {
 	}
 	serverKeys := parseSSHScan(r.Stdout)
 
-	sshKeygenBinaryPath, err := ex.LookPath("ssh-keygen")
+	sshKeygenBinaryPath, err := lookpath(c.Distro.Family, "ssh-keygen")
 	if err != nil {
 		return xerrors.Errorf("Failed to lookup ssh-keygen binary path. err: %w", err)
 	}
@@ -441,6 +495,19 @@ func validateSSHConfig(c *config.ServerInfo) error {
 	return xerrors.Errorf("Failed to find the host in known_hosts. Please exec `$ %s` or `$ %s`",
 		strings.Join(buildSSHBaseCmd(sshBinaryPath, c, nil), " "),
 		buildSSHKeyScanCmd(sshKeyscanBinaryPath, c.Port, knownHostsPaths[0], sshConfig))
+}
+
+func lookpath(family, file string) (string, error) {
+	switch family {
+	case constant.Windows:
+		return fmt.Sprintf("%s.exe", strings.TrimPrefix(file, ".exe")), nil
+	default:
+		p, err := ex.LookPath(file)
+		if err != nil {
+			return "", err
+		}
+		return p, nil
+	}
 }
 
 func buildSSHBaseCmd(sshBinaryPath string, c *config.ServerInfo, options []string) []string {
@@ -498,6 +565,7 @@ type sshConfiguration struct {
 func parseSSHConfiguration(stdout string) sshConfiguration {
 	sshConfig := sshConfiguration{}
 	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSuffix(line, "\r")
 		switch {
 		case strings.HasPrefix(line, "user "):
 			sshConfig.user = strings.TrimPrefix(line, "user ")
@@ -527,6 +595,7 @@ func parseSSHConfiguration(stdout string) sshConfiguration {
 func parseSSHScan(stdout string) map[string]string {
 	keys := map[string]string{}
 	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSuffix(line, "\r")
 		if line == "" || strings.HasPrefix(line, "# ") {
 			continue
 		}
@@ -539,6 +608,7 @@ func parseSSHScan(stdout string) map[string]string {
 
 func parseSSHKeygen(stdout string) (string, string, error) {
 	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSuffix(line, "\r")
 		if line == "" || strings.HasPrefix(line, "# ") {
 			continue
 		}
@@ -684,10 +754,20 @@ func (s Scanner) detectOS(c config.ServerInfo) osTypeInterface {
 		return osType
 	}
 
-	if itsMe, osType, fatalErr := s.detectDebianWithRetry(c); fatalErr != nil {
-		osType.setErrs([]error{xerrors.Errorf("Failed to detect OS: %w", fatalErr)})
+	if !isLocalExec(c.Port, c.Host) {
+		if err := testFirstSSHConnection(c); err != nil {
+			osType := &unknown{base{ServerInfo: c}}
+			osType.setErrs([]error{xerrors.Errorf("Failed to test first SSH Connection. err: %w", err)})
+			return osType
+		}
+	}
+
+	if itsMe, osType := detectWindows(c); itsMe {
+		logging.Log.Debugf("Windows. Host: %s:%s", c.Host, c.Port)
 		return osType
-	} else if itsMe {
+	}
+
+	if itsMe, osType := detectDebian(c); itsMe {
 		logging.Log.Debugf("Debian based Linux. Host: %s:%s", c.Host, c.Port)
 		return osType
 	}
@@ -712,38 +792,28 @@ func (s Scanner) detectOS(c config.ServerInfo) osTypeInterface {
 		return osType
 	}
 
-	if itsMe, osType := detectWindows(c); itsMe {
-		logging.Log.Debugf("Windows. Host: %s:%s", c.Host, c.Port)
-		return osType
-	}
-
 	osType := &unknown{base{ServerInfo: c}}
 	osType.setErrs([]error{xerrors.New("Unknown OS Type")})
 	return osType
 }
 
-// Retry as it may stall on the first SSH connection
-// https://github.com/future-architect/vuls/pull/753
-func (s Scanner) detectDebianWithRetry(c config.ServerInfo) (itsMe bool, deb osTypeInterface, err error) {
-	type Response struct {
-		itsMe bool
-		deb   osTypeInterface
-		err   error
+func testFirstSSHConnection(c config.ServerInfo) error {
+	for i := 3; i > 0; i-- {
+		rChan := make(chan execResult, 1)
+		go func() {
+			rChan <- exec(c, "exit", noSudo)
+		}()
+		select {
+		case r := <-rChan:
+			if r.ExitStatus == 255 {
+				return xerrors.Errorf("Unable to connect via SSH. Scan with -vvv option to print SSH debugging messages and check SSH settings.\n%s", r)
+			}
+			return nil
+		case <-time.After(time.Duration(3) * time.Second):
+		}
 	}
-	resChan := make(chan Response, 1)
-	go func(c config.ServerInfo) {
-		itsMe, osType, fatalErr := detectDebian(c)
-		resChan <- Response{itsMe, osType, fatalErr}
-	}(c)
-
-	timeout := time.After(time.Duration(3) * time.Second)
-	select {
-	case res := <-resChan:
-		return res.itsMe, res.deb, res.err
-	case <-timeout:
-		time.Sleep(100 * time.Millisecond)
-		return detectDebian(c)
-	}
+	logging.Log.Warnf("First SSH Connection to Host: %s:%s timeout", c.Host, c.Port)
+	return nil
 }
 
 // checkScanModes checks scan mode

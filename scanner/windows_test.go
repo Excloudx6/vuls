@@ -4,26 +4,22 @@ import (
 	"reflect"
 	"testing"
 
-	"golang.org/x/exp/slices"
-
+	"github.com/future-architect/vuls/config"
 	"github.com/future-architect/vuls/models"
+	"golang.org/x/exp/slices"
 )
 
 func Test_parseSystemInfo(t *testing.T) {
-	type args struct {
-		stdout string
-	}
 	tests := []struct {
 		name    string
-		args    args
-		release string
+		args    string
+		osInfo  osInfo
 		kbs     []string
 		wantErr bool
 	}{
 		{
 			name: "happy",
-			args: args{
-				stdout: `
+			args: `
 Host Name:                 DESKTOP
 OS Name:                   Microsoft Windows 10 Pro
 OS Version:                10.0.19044 N/A Build 19044
@@ -75,21 +71,28 @@ Hyper-V Requirements:      VM Monitor Mode Extensions: Yes
 						   Second Level Address Translation: Yes
 						   Data Execution Prevention Available: Yes
 `,
+			osInfo: osInfo{
+				productName:      "Microsoft Windows 10 Pro",
+				version:          "10.0",
+				build:            "19044",
+				revision:         "",
+				edition:          "",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Client",
 			},
-			release: "Windows 10 Version 21H2 for x64-based Systems",
-			kbs:     []string{"5012117", "4562830", "5003791", "5007401", "5012599", "5011651", "5005699"},
-			wantErr: false,
+			kbs: []string{"5012117", "4562830", "5003791", "5007401", "5012599", "5011651", "5005699"},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			release, kbs, err := parseSystemInfo(tt.args.stdout)
+			osInfo, kbs, err := parseSystemInfo(tt.args)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("parseSystemInfo() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if release != tt.release {
-				t.Errorf("parseSystemInfo() got = %v, want %v", release, tt.release)
+			if osInfo != tt.osInfo {
+				t.Errorf("parseSystemInfo() got = %v, want %v", osInfo, tt.osInfo)
 			}
 			if !reflect.DeepEqual(kbs, tt.kbs) {
 				t.Errorf("parseSystemInfo() got = %v, want %v", kbs, tt.kbs)
@@ -99,19 +102,15 @@ Hyper-V Requirements:      VM Monitor Mode Extensions: Yes
 }
 
 func Test_parseGetComputerInfo(t *testing.T) {
-	type args struct {
-		stdout string
-	}
 	tests := []struct {
 		name    string
-		args    args
-		want    string
+		args    string
+		want    osInfo
 		wantErr bool
 	}{
 		{
 			name: "happy",
-			args: args{
-				stdout: `
+			args: `
 WindowsProductName         : Windows 10 Pro
 OsVersion                  : 10.0.19044
 WindowsEditionId           : Professional
@@ -119,20 +118,236 @@ OsCSDVersion               :
 CsSystemType               : x64-based PC
 WindowsInstallationType    : Client
 `,
+			want: osInfo{
+				productName:      "Windows 10 Pro",
+				version:          "10.0",
+				build:            "19044",
+				revision:         "",
+				edition:          "Professional",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Client",
 			},
-			want:    "Windows 10 Version 21H2 for x64-based Systems",
-			wantErr: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseGetComputerInfo(tt.args.stdout)
+			got, err := parseGetComputerInfo(tt.args)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("parseGetComputerInfo() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if got != tt.want {
 				t.Errorf("parseGetComputerInfo() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_parseWmiObject(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    string
+		want    osInfo
+		wantErr bool
+	}{
+		{
+			name: "happy",
+			args: `
+Caption            : Microsoft Windows 10 Pro
+Version            : 10.0.19044
+OperatingSystemSKU : 48
+CSDVersion         :
+
+
+
+
+
+DomainRole : 1
+SystemType : x64-based PC`,
+			want: osInfo{
+				productName:      "Microsoft Windows 10 Pro",
+				version:          "10.0",
+				build:            "19044",
+				revision:         "",
+				edition:          "Professional",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Client",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseWmiObject(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseWmiObject() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("parseWmiObject() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_parseRegistry(t *testing.T) {
+	type args struct {
+		stdout string
+		arch   string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    osInfo
+		wantErr bool
+	}{
+		{
+			name: "happy",
+			args: args{
+				stdout: `
+ProductName               : Windows 10 Pro
+CurrentVersion            : 6.3
+CurrentMajorVersionNumber : 10
+CurrentMinorVersionNumber : 0
+CurrentBuildNumber        : 19044
+UBR                       : 2364
+EditionID                 : Professional
+InstallationType          : Client`,
+				arch: "AMD64",
+			},
+			want: osInfo{
+				productName:      "Windows 10 Pro",
+				version:          "10.0",
+				build:            "19044",
+				revision:         "2364",
+				edition:          "Professional",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Client",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseRegistry(tt.args.stdout, tt.args.arch)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseRegistry() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("parseRegistry() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_detectOSName(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    osInfo
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "Windows 10 for x64-based Systems",
+			args: osInfo{
+				productName:      "Microsoft Windows 10 Pro",
+				version:          "10.0",
+				build:            "10585",
+				revision:         "",
+				edition:          "Professional",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Client",
+			},
+			want: "Windows 10 for x64-based Systems",
+		},
+		{
+			name: "Windows 10 Version 21H2 for x64-based Systems",
+			args: osInfo{
+				productName:      "Microsoft Windows 10 Pro",
+				version:          "10.0",
+				build:            "19044",
+				revision:         "",
+				edition:          "Professional",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Client",
+			},
+			want: "Windows 10 Version 21H2 for x64-based Systems",
+		},
+		{
+			name: "Windows Server 2022",
+			args: osInfo{
+				productName:      "Windows Server",
+				version:          "10.0",
+				build:            "30000",
+				revision:         "",
+				edition:          "",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Server",
+			},
+			want: "Windows Server 2022",
+		},
+		{
+			name: "err",
+			args: osInfo{
+				productName:      "Microsoft Windows 10 Pro",
+				version:          "10.0",
+				build:            "build",
+				revision:         "",
+				edition:          "Professional",
+				servicePack:      "",
+				arch:             "x64-based",
+				installationType: "Client",
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := detectOSName(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("detectOSName() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("detectOSName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_formatKernelVersion(t *testing.T) {
+	tests := []struct {
+		name string
+		args osInfo
+		want string
+	}{
+		{
+			name: "major.minor.build.revision",
+			args: osInfo{
+				version:  "10.0",
+				build:    "19045",
+				revision: "2130",
+			},
+			want: "10.0.19045.2130",
+		},
+		{
+			name: "major.minor.build",
+			args: osInfo{
+				version: "10.0",
+				build:   "19045",
+			},
+			want: "10.0.19045",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatKernelVersion(tt.args); got != tt.want {
+				t.Errorf("formatKernelVersion() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -360,6 +575,140 @@ ResultCode : 2
 			slices.Sort(got)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("windows.parseWindowsUpdateHistory() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_windows_detectKernelVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		base    base
+		args    []string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "major.minor.build, applied on 10",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 10 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0.19045"}},
+			},
+			args: []string{"5020030", "5019275"},
+			want: "10.0.19045.2546",
+		},
+		{
+			name: "major.minor.build.revision",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 10 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0.19045.2130"}},
+			},
+			want: "10.0.19045.2130",
+		},
+		{
+			name: "major.minor.build, applied on 11",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 11 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0.22621"}},
+			},
+			args: []string{"5017389", "5022303"},
+			want: "10.0.22621.1105",
+		},
+		{
+			name: "server",
+			base: base{
+				Distro:     config.Distro{Release: "Windows Server 2022"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0.20348"}},
+			},
+			want: "10.0.20348",
+		},
+		{
+			name: "major.minor",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 10 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0"}},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := &windows{
+				base: tt.base,
+			}
+			got, err := o.detectKernelVersion(tt.args)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("windows.detectKernelVersion() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("windows.detectKernelVersion() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_windows_detectKBsFromKernelVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		base    base
+		want    models.WindowsKB
+		wantErr bool
+	}{
+		{
+			name: "10.0.19045.2129",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 10 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0.19045.2129"}},
+			},
+			want: models.WindowsKB{
+				Applied:   nil,
+				Unapplied: []string{"5019959", "5020030", "5021233", "5022282", "5019275", "5022834"},
+			},
+		},
+		{
+			name: "10.0.19045.2130",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 10 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0.19045.2130"}},
+			},
+			want: models.WindowsKB{
+				Applied:   nil,
+				Unapplied: []string{"5019959", "5020030", "5021233", "5022282", "5019275", "5022834"},
+			},
+		},
+		{
+			name: "10.0.22621.1105",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 11 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0.22621.1105"}},
+			},
+			want: models.WindowsKB{
+				Applied:   []string{"5019311", "5017389", "5018427", "5019509", "5018496", "5019980", "5020044", "5021255", "5022303"},
+				Unapplied: []string{"5022360"},
+			},
+		},
+		{
+			name: "err",
+			base: base{
+				Distro:     config.Distro{Release: "Windows 10 Version 22H2 for x64-based Systems"},
+				osPackages: osPackages{Kernel: models.Kernel{Version: "10.0"}},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			o := &windows{
+				base: tt.base,
+			}
+			got, err := o.detectKBsFromKernelVersion()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("windows.detectKBsFromKernelVersion() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("windows.detectKBsFromKernelVersion() = %v, want %v", got, tt.want)
 			}
 		})
 	}
