@@ -6,7 +6,7 @@ package gost
 import (
 	"encoding/json"
 	"fmt"
-	"regexp"
+	"strconv"
 	"strings"
 
 	"golang.org/x/xerrors"
@@ -68,8 +68,6 @@ type cveContent struct {
 	fixStatuses models.PackageFixStatuses
 }
 
-var kernelSourceNamePattern = regexp.MustCompile(`^linux((-(ti-omap4|armadaxp|mako|manta|flo|goldfish|joule|raspi2?|snapdragon|aws|azure|bluefield|dell300x|gcp|gke(op)?|ibm|intel|lowlatency|kvm|oem|oracle|euclid|lts-xenial|hwe|riscv))?(-(edge|fde|iotg|hwe|osp1))?(-[\d\.]+)?)?$`)
-
 // DetectCVEs fills cve information that has in Gost
 func (ubu Ubuntu) DetectCVEs(r *models.ScanResult, _ bool) (nCVEs int, err error) {
 	ubuReleaseVer := strings.Replace(r.Release, ".", "", 1)
@@ -96,7 +94,7 @@ func (ubu Ubuntu) DetectCVEs(r *models.ScanResult, _ bool) (nCVEs int, err error
 
 			n := strings.NewReplacer("linux-signed", "linux", "linux-meta", "linux").Replace(res.request.packName)
 
-			if kernelSourceNamePattern.MatchString(n) {
+			if isKernelSourcePackage(n) {
 				isDetect := false
 				for _, bn := range r.SrcPackages[res.request.packName].BinaryNames {
 					if bn == fmt.Sprintf("linux-image-%s", r.RunningKernel.Release) {
@@ -133,7 +131,7 @@ func (ubu Ubuntu) DetectCVEs(r *models.ScanResult, _ bool) (nCVEs int, err error
 
 			n := strings.NewReplacer("linux-signed", "linux", "linux-meta", "linux").Replace(res.request.packName)
 
-			if kernelSourceNamePattern.MatchString(n) {
+			if isKernelSourcePackage(n) {
 				isDetect := false
 				for _, bn := range r.SrcPackages[res.request.packName].BinaryNames {
 					if bn == fmt.Sprintf("linux-image-%s", r.RunningKernel.Release) {
@@ -162,7 +160,7 @@ func (ubu Ubuntu) DetectCVEs(r *models.ScanResult, _ bool) (nCVEs int, err error
 		for _, pack := range r.SrcPackages {
 			n := strings.NewReplacer("linux-signed", "linux", "linux-meta", "linux").Replace(pack.Name)
 
-			if kernelSourceNamePattern.MatchString(n) {
+			if isKernelSourcePackage(n) {
 				isDetect := false
 				for _, bn := range pack.BinaryNames {
 					if bn == fmt.Sprintf("linux-image-%s", r.RunningKernel.Release) {
@@ -243,7 +241,7 @@ func detect(cves map[string]gostmodels.UbuntuCVE, fixed bool, srcPkg models.SrcP
 					patchedVersion := rp.Note
 
 					// https://git.launchpad.net/ubuntu-cve-tracker/tree/scripts/generate-oval#n384
-					if kernelSourceNamePattern.MatchString(n) && strings.HasPrefix(srcPkg.Name, "linux-meta") {
+					if isKernelSourcePackage(n) && strings.HasPrefix(srcPkg.Name, "linux-meta") {
 						// 5.15.0.1026.30~20.04.16 -> 5.15.0.1026
 						ss := strings.Split(installedVersion, ".")
 						if len(ss) >= 4 {
@@ -265,7 +263,7 @@ func detect(cves map[string]gostmodels.UbuntuCVE, fixed bool, srcPkg models.SrcP
 
 					if affected {
 						for _, bn := range srcPkg.BinaryNames {
-							if kernelSourceNamePattern.MatchString(n) && bn != runningKernelBinaryPkgName {
+							if isKernelSourcePackage(n) && bn != runningKernelBinaryPkgName {
 								continue
 							}
 							c.fixStatuses = append(c.fixStatuses, models.PackageFixStatus{
@@ -278,7 +276,7 @@ func detect(cves map[string]gostmodels.UbuntuCVE, fixed bool, srcPkg models.SrcP
 			}
 		} else {
 			for _, bn := range srcPkg.BinaryNames {
-				if kernelSourceNamePattern.MatchString(n) && bn != runningKernelBinaryPkgName {
+				if isKernelSourcePackage(n) && bn != runningKernelBinaryPkgName {
 					continue
 				}
 				c.fixStatuses = append(c.fixStatuses, models.PackageFixStatus{
@@ -326,5 +324,115 @@ func (ubu Ubuntu) ConvertToModel(cve *gostmodels.UbuntuCVE) *models.CveContent {
 		SourceLink:    "https://ubuntu.com/security/" + cve.Candidate,
 		References:    references,
 		Published:     cve.PublicDate,
+	}
+}
+
+// https://git.launchpad.net/ubuntu-cve-tracker/tree/scripts/cve_lib.py#n931
+func isKernelSourcePackage(pkgname string) bool {
+	switch ss := strings.Split(pkgname, "-"); len(ss) {
+	case 1:
+		return pkgname == "linux"
+	case 2:
+		if ss[0] != "linux" {
+			return false
+		}
+		switch ss[1] {
+		case "armadaxp", "mako", "manta", "flo", "goldfish", "joule", "raspi", "raspi2", "snapdragon", "aws", "azure", "bluefield", "dell300x", "gcp", "gke", "gkeop", "ibm", "lowlatency", "kvm", "oem", "oracle", "euclid", "hwe", "riscv":
+			return true
+		default:
+			_, err := strconv.ParseFloat(ss[1], 64)
+			return err == nil
+		}
+	case 3:
+		if ss[0] != "linux" {
+			return false
+		}
+		switch ss[1] {
+		case "ti":
+			return ss[2] == "omap4"
+		case "raspi", "raspi2", "gke", "gkeop", "ibm", "oracle", "riscv":
+			_, err := strconv.ParseFloat(ss[2], 64)
+			return err == nil
+		case "aws":
+			switch ss[2] {
+			case "hwe", "edge":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[2], 64)
+				return err == nil
+			}
+		case "azure":
+			switch ss[2] {
+			case "fde", "edge":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[2], 64)
+				return err == nil
+			}
+		case "gcp":
+			switch ss[2] {
+			case "edge":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[2], 64)
+				return err == nil
+			}
+		case "intel":
+			switch ss[2] {
+			case "iotg":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[2], 64)
+				return err == nil
+			}
+		case "oem":
+			switch ss[2] {
+			case "osp1":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[2], 64)
+				return err == nil
+			}
+		case "lts":
+			return ss[2] == "xenial"
+		case "hwe":
+			switch ss[2] {
+			case "edge":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[2], 64)
+				return err == nil
+			}
+		default:
+			return false
+		}
+	case 4:
+		if ss[0] != "linux" {
+			return false
+		}
+		switch ss[1] {
+		case "azure":
+			if ss[2] != "fde" {
+				return false
+			}
+			_, err := strconv.ParseFloat(ss[3], 64)
+			return err == nil
+		case "intel":
+			if ss[2] != "iotg" {
+				return false
+			}
+			_, err := strconv.ParseFloat(ss[3], 64)
+			return err == nil
+		case "lowlatency":
+			if ss[2] != "hwe" {
+				return false
+			}
+			_, err := strconv.ParseFloat(ss[3], 64)
+			return err == nil
+		default:
+			return false
+		}
+	default:
+		return false
 	}
 }
